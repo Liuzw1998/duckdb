@@ -2267,6 +2267,7 @@ shared_ptr<RowGroupCollection> RowGroupCollection::AlterType(ClientContext &cont
 	scan_state.Initialize(bound_columns);
 	scan_state.table_state.Initialize(context, GetTypes());
 	scan_state.table_state.max_row = row_groups->GetBaseRowId() + next_row_id.load();
+	TransactionData transaction(DuckTransaction::Get(context, info->GetDB()));
 
 	// now alter the type of the column within all of the row_groups individually
 	auto lock = result->stats.GetLock();
@@ -2276,7 +2277,7 @@ shared_ptr<RowGroupCollection> RowGroupCollection::AlterType(ClientContext &cont
 	for (auto &node : row_groups->SegmentNodes()) {
 		auto &current_row_group = node.GetNode();
 		auto new_row_group = current_row_group.AlterType(*result, target_type, changed_idx, executor,
-		                                                 scan_state.table_state, node, scan_chunk);
+		                                                 scan_state.table_state, node, scan_chunk, transaction);
 		new_row_group->MergeIntoStatistics(changed_idx, changed_stats.Statistics());
 		result_row_groups->AppendSegment(std::move(new_row_group), node.GetRowStart());
 	}
