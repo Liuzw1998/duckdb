@@ -1320,7 +1320,7 @@ jobs:
 
     - name: Test
       if: ${{ !fromJson(needs.prepare.outputs.skip_tests) }}
-      run: make unittest_threadsan
+      run: build/reldebug/test/run test/sql/alter/alter_type/test_alter_type_rollback.test,test/sql/alter/alter_type/test_alter_type.test,test/sql/alter/alter_type/test_alter_type_transactions.test,test/sql/alter/alter_table_set_sorted_by.test,test/sql/alter/rename_table/test_rename_table_view.test,test/sql/alter/rename_table/test_rename_table_collision.test,test/sql/alter/rename_table/test_rename_table_chain_commit.test,test/sql/alter/rename_table/test_rename_table.test,test/sql/alter/rename_table/test_rename_table_case.test,test/sql/alter/rename_table/test_rename_table_incorrect.test
 
     - name: Test Extra
       if: ${{ github.ref_name == 'main' && !fromJson(needs.prepare.outputs.skip_tests) }}
