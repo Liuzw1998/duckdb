@@ -459,13 +459,13 @@ static bool FindUpdatedTuple(UpdateInfo &current, idx_t row_idx, idx_t &update_i
 }
 
 static void FetchRowsValidity(transaction_t start_time, transaction_t transaction_id, UpdateInfo &info,
-                              const idx_t *offsets, const SelectionVector &sel, idx_t fetch_offset, idx_t count,
-                              idx_t vector_offset, Vector &result, idx_t result_offset) {
+                              const idx_t *offsets, idx_t fetch_offset, idx_t count, idx_t vector_offset,
+                              Vector &result, idx_t result_offset) {
 	auto &result_mask = FlatVector::ValidityMutable(result);
 	UpdateInfo::UpdatesForTransaction(info, start_time, transaction_id, [&](UpdateInfo &current) {
 		auto info_data = current.GetData<bool>();
 		for (idx_t idx = 0; idx < count; idx++) {
-			const idx_t row_idx = offsets[sel.get_index(fetch_offset + idx)] - vector_offset;
+			const idx_t row_idx = offsets[fetch_offset + idx] - vector_offset;
 			idx_t update_idx;
 			if (FindUpdatedTuple(current, row_idx, update_idx)) {
 				result_mask.Set(result_offset + fetch_offset + idx, info_data[update_idx]);
@@ -476,13 +476,13 @@ static void FetchRowsValidity(transaction_t start_time, transaction_t transactio
 
 template <class T>
 static void TemplatedFetchRows(transaction_t start_time, transaction_t transaction_id, UpdateInfo &info,
-                               const idx_t *offsets, const SelectionVector &sel, idx_t fetch_offset, idx_t count,
-                               idx_t vector_offset, Vector &result, idx_t result_offset) {
+                               const idx_t *offsets, idx_t fetch_offset, idx_t count, idx_t vector_offset,
+                               Vector &result, idx_t result_offset) {
 	auto result_data = FlatVector::GetDataMutable<T>(result);
 	UpdateInfo::UpdatesForTransaction(info, start_time, transaction_id, [&](UpdateInfo &current) {
 		auto info_data = current.GetData<T>();
 		for (idx_t idx = 0; idx < count; idx++) {
-			const idx_t row_idx = offsets[sel.get_index(fetch_offset + idx)] - vector_offset;
+			const idx_t row_idx = offsets[fetch_offset + idx] - vector_offset;
 			idx_t update_idx;
 			if (FindUpdatedTuple(current, row_idx, update_idx)) {
 				result_data[result_offset + fetch_offset + idx] = info_data[update_idx];
@@ -529,15 +529,15 @@ static UpdateSegment::fetch_rows_function_t GetFetchRowsFunction(PhysicalType ty
 	}
 }
 
-void UpdateSegment::FetchRows(TransactionData transaction, const idx_t *offsets, const SelectionVector &sel,
-                              idx_t fetch_count, Vector &result, idx_t result_offset) {
+void UpdateSegment::FetchRows(TransactionData transaction, const idx_t *offsets, idx_t fetch_count, Vector &result,
+                              idx_t result_offset) {
 	if (fetch_count == 0 || !root) {
 		return;
 	}
 
 	auto lock_handle = lock.GetSharedLock();
 	for (idx_t idx = 0; idx < fetch_count;) {
-		const idx_t offset = offsets[sel.get_index(idx)];
+		const idx_t offset = offsets[idx];
 		if (offset > column_data.count) {
 			throw InternalException("UpdateSegment::FetchRows out of range");
 		}
@@ -545,7 +545,7 @@ void UpdateSegment::FetchRows(TransactionData transaction, const idx_t *offsets,
 		const idx_t vector_offset = vector_index * STANDARD_VECTOR_SIZE;
 		idx_t vector_count = 1;
 		while (idx + vector_count < fetch_count) {
-			const idx_t next_offset = offsets[sel.get_index(idx + vector_count)];
+			const idx_t next_offset = offsets[idx + vector_count];
 			if (next_offset > column_data.count) {
 				throw InternalException("UpdateSegment::FetchRows out of range");
 			}
@@ -558,8 +558,8 @@ void UpdateSegment::FetchRows(TransactionData transaction, const idx_t *offsets,
 		auto entry = GetUpdateNode(*lock_handle, vector_index);
 		if (entry.IsSet()) {
 			auto pin = entry.Pin();
-			fetch_rows_function(transaction.start_time, transaction.transaction_id, UpdateInfo::Get(pin), offsets, sel,
-			                    idx, vector_count, vector_offset, result, result_offset);
+			fetch_rows_function(transaction.start_time, transaction.transaction_id, UpdateInfo::Get(pin), offsets, idx,
+			                    vector_count, vector_offset, result, result_offset);
 		}
 		idx += vector_count;
 	}

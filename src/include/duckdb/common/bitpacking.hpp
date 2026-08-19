@@ -102,6 +102,26 @@ public:
 		return ((count * width) / 8);
 	}
 
+	template <class FUNC>
+	inline static void ForEachSelectedAlgorithmGroup(const idx_t *offsets, idx_t count, idx_t base_offset,
+	                                                 FUNC &&callback) {
+		D_ASSERT(offsets);
+		D_ASSERT(count > 0);
+		idx_t group_begin = 0;
+		while (group_begin < count) {
+			D_ASSERT(offsets[group_begin] >= base_offset);
+			const idx_t group_start = (offsets[group_begin] - base_offset) / BITPACKING_ALGORITHM_GROUP_SIZE *
+			                          BITPACKING_ALGORITHM_GROUP_SIZE;
+			const idx_t group_end = group_start + BITPACKING_ALGORITHM_GROUP_SIZE;
+			idx_t group_next = group_begin + 1;
+			while (group_next < count && offsets[group_next] - base_offset < group_end) {
+				group_next++;
+			}
+			callback(group_begin, group_next, group_start);
+			group_begin = group_next;
+		}
+	}
+
 	template <class T>
 	inline static T RoundUpToAlgorithmGroupSize(T num_to_round) {
 		int remainder = num_to_round % BITPACKING_ALGORITHM_GROUP_SIZE;

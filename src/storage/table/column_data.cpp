@@ -316,7 +316,7 @@ void ColumnData::FetchUpdateRow(TransactionData transaction, row_t row_id, Vecto
 		return;
 	}
 	const idx_t offset = NumericCast<idx_t>(row_id);
-	updates->FetchRows(transaction, &offset, *FlatVector::IncrementalSelectionVector(), 1, result, result_idx);
+	updates->FetchRows(transaction, &offset, 1, result, result_idx);
 }
 
 void ColumnData::UpdateInternal(TransactionData transaction, DuckTableEntry &table_entry, idx_t column_index,
@@ -692,39 +692,74 @@ idx_t ColumnData::Fetch(ColumnScanState &state, row_t row_id, Vector &result) {
 }
 
 void ColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state, const StorageIndex &storage_index,
-                           const idx_t *offsets, const SelectionVector &sel, idx_t fetch_count, Vector &result,
-                           idx_t result_offset) {
-	FetchRowsAtSegmentLevel(transaction, state, offsets, sel, fetch_count, result, result_offset);
+                           const idx_t *offsets, idx_t fetch_count, Vector &result, idx_t result_offset) {
+	FetchRowsAtSegmentLevel(transaction, state, offsets, fetch_count, result, result_offset);
 }
 
 void ColumnData::FetchRowsAtSegmentLevel(TransactionData transaction, ColumnFetchState &state, const idx_t *offsets,
-                                         const SelectionVector &sel, idx_t fetch_count, Vector &result,
-                                         idx_t result_offset) {
+                                         idx_t fetch_count, Vector &result, idx_t result_offset) {
 	if (fetch_count == 0) {
 		return;
 	}
+	if (!offsets) {
+		throw InternalException("ColumnData::FetchRowsAtSegmentLevel - offsets cannot be null");
+	}
+	if (fetch_count > STANDARD_VECTOR_SIZE) {
+		throw InternalException("ColumnData::FetchRowsAtSegmentLevel cannot fetch more than a vector at a time");
+	}
+	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
+		throw InternalException("ColumnData::FetchRowsAtSegmentLevel requires a flat result vector");
+	}
+	const idx_t result_capacity = FlatVector::GetCapacity(result);
+	if (result_offset > result_capacity || fetch_count > result_capacity - result_offset) {
+		throw InternalException("ColumnData::FetchRowsAtSegmentLevel - result offset out of range");
+	}
+	const idx_t column_count = count.load();
+	for (idx_t idx = 0; idx < fetch_count; idx++) {
+		const idx_t offset = offsets[idx];
+		if (offset >= column_count) {
+			throw InternalException("ColumnData::FetchRowsAtSegmentLevel - row_id %lld out of range for count %lld",
+			                        offset, column_count);
+		}
+	}
 
+	idx_t segment_offsets[STANDARD_VECTOR_SIZE];
 	optional_ptr<SegmentNode<ColumnSegment>> current_segment;
 	idx_t segment_start = 0;
-	idx_t segment_end = 0;
-	for (idx_t idx = 0; idx < fetch_count; idx++) {
-		const idx_t offset = offsets[sel.get_index(idx)];
-		if (offset > count) {
-			throw InternalException("ColumnData::FetchRowsAtSegmentLevel - row_id %lld out of range for count %lld",
-			                        offset, count);
-		}
-		if (!current_segment || offset < segment_start || offset >= segment_end) {
+	idx_t segment_count = 0;
+	idx_t idx = 0;
+	while (idx < fetch_count) {
+		const idx_t offset = offsets[idx];
+		if (!current_segment || offset < segment_start || offset - segment_start >= segment_count) {
 			current_segment = data.GetSegment(offset);
 			segment_start = current_segment->GetRowStart();
-			segment_end = segment_start + current_segment->GetNode().count;
+			segment_count = current_segment->GetNode().count.load();
+			if (offset < segment_start || offset - segment_start >= segment_count) {
+				throw InternalException("ColumnData::FetchRowsAtSegmentLevel - invalid segment bounds");
+			}
 		}
-		const idx_t index_in_segment = offset - segment_start;
-		current_segment->GetNode().FetchRow(state, NumericCast<row_t>(index_in_segment), result, result_offset + idx);
+
+		idx_t run_count = 1;
+		while (idx + run_count < fetch_count) {
+			const idx_t next_offset = offsets[idx + run_count];
+			if (next_offset < segment_start || next_offset - segment_start >= segment_count) {
+				break;
+			}
+			if (next_offset <= offsets[idx + run_count - 1]) {
+				break;
+			}
+			run_count++;
+		}
+		for (idx_t run_idx = 0; run_idx < run_count; run_idx++) {
+			segment_offsets[run_idx] = offsets[idx + run_idx] - segment_start;
+		}
+		current_segment->GetNode().FetchRows(state, segment_offsets, run_count, result, result_offset + idx);
+		idx += run_count;
 	}
 	{
 		const lock_guard<mutex> update_guard(update_lock);
 		if (updates) {
-			updates->FetchRows(transaction, offsets, sel, fetch_count, result, result_offset);
+			updates->FetchRows(transaction, offsets, fetch_count, result, result_offset);
 		}
 	}
 }

@@ -1,0 +1,836 @@
+# name: test/sql/index/art/scan/test_art_segment_batch_fetch.test_slow
+# description: Test segment-aware batch fetches from ART scans.
+# group: [scan]
+
+load {TEST_DIR}/art_segment_batch_fetch.db
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE batch_fetch (
+    id BIGINT USING COMPRESSION BitPacking,
+    group_key BIGINT USING COMPRESSION BitPacking,
+    packed_value BIGINT USING COMPRESSION BitPacking,
+    rle_value BIGINT USING COMPRESSION RLE,
+    double_value DOUBLE USING COMPRESSION ALPRD,
+    dict_value VARCHAR USING COMPRESSION DICT_FSST,
+    zstd_value VARCHAR USING COMPRESSION ZSTD
+);
+
+statement ok
+INSERT INTO batch_fetch
+SELECT i,
+       i % 97,
+       (hash(i) % 9223372036854775807)::BIGINT,
+       i // 100,
+       hash(i)::DOUBLE / 18446744073709551615.0,
+       CASE WHEN i % 17 = 0 THEN NULL ELSE 'dict_' || lpad(i::VARCHAR, 12, '0') END,
+       CASE WHEN i % 19 = 0 THEN NULL ELSE 'zstd_' || lpad(i::VARCHAR, 12, '0') END
+FROM generate_series(1, 300000) t(i);
+
+statement ok
+CREATE INDEX batch_fetch_id ON batch_fetch(id);
+
+statement ok
+CREATE INDEX batch_fetch_group ON batch_fetch(group_key);
+
+statement ok
+FORCE CHECKPOINT;
+
+# Force codecs that are not selected for the mixed table above.
+statement ok
+SET force_compression = 'alp';
+
+statement ok
+CREATE TABLE alp_fetch (id BIGINT, lookup_key BIGINT, payload_float FLOAT, payload_double DOUBLE);
+
+statement ok
+INSERT INTO alp_fetch
+SELECT i,
+       i % 8,
+       CASE i % 997 WHEN 0 THEN 'NaN'::FLOAT
+                    WHEN 1 THEN 'Infinity'::FLOAT
+                    WHEN 2 THEN '-Infinity'::FLOAT
+                    WHEN 3 THEN NULL
+                    ELSE i::FLOAT / 10 END,
+       CASE i % 997 WHEN 0 THEN 'NaN'::DOUBLE
+                    WHEN 1 THEN 'Infinity'::DOUBLE
+                    WHEN 2 THEN '-Infinity'::DOUBLE
+                    WHEN 3 THEN NULL
+                    ELSE i::DOUBLE / 10 END
+FROM generate_series(1, 300000) t(i);
+
+statement ok
+CREATE INDEX alp_fetch_id ON alp_fetch(id);
+
+statement ok
+CREATE INDEX alp_fetch_lookup ON alp_fetch(lookup_key);
+
+statement ok
+FORCE CHECKPOINT;
+
+statement ok
+SET force_compression = 'alprd';
+
+statement ok
+CREATE TABLE alprd_fetch (id BIGINT, lookup_key BIGINT, payload_float FLOAT, payload_double DOUBLE);
+
+statement ok
+INSERT INTO alprd_fetch
+SELECT i,
+       i % 8,
+       CASE i % 997 WHEN 0 THEN 'NaN'::FLOAT
+                    WHEN 1 THEN 'Infinity'::FLOAT
+                    WHEN 2 THEN '-Infinity'::FLOAT
+                    WHEN 3 THEN NULL
+                    ELSE hash(i)::FLOAT / 18446744073709551615.0 END,
+       CASE i % 997 WHEN 0 THEN 'NaN'::DOUBLE
+                    WHEN 1 THEN 'Infinity'::DOUBLE
+                    WHEN 2 THEN '-Infinity'::DOUBLE
+                    WHEN 3 THEN NULL
+                    ELSE hash(i)::DOUBLE / 18446744073709551615.0 END
+FROM generate_series(1, 300000) t(i);
+
+statement ok
+CREATE INDEX alprd_fetch_id ON alprd_fetch(id);
+
+statement ok
+CREATE INDEX alprd_fetch_lookup ON alprd_fetch(lookup_key);
+
+statement ok
+FORCE CHECKPOINT;
+
+statement ok
+SET force_compression = 'zstd';
+
+statement ok
+CREATE TABLE zstd_fetch (id BIGINT, lookup_key BIGINT, payload VARCHAR);
+
+statement ok
+INSERT INTO zstd_fetch
+SELECT i,
+       i % 8,
+       CASE WHEN i % 19 = 0 THEN NULL
+            WHEN i % 23 = 0 THEN ''
+            ELSE repeat('zstd_' || lpad(i::VARCHAR, 12, '0') || '_' || hash(i)::VARCHAR || ';', 4) END
+FROM generate_series(1, 300000) t(i);
+
+statement ok
+CREATE INDEX zstd_fetch_id ON zstd_fetch(id);
+
+statement ok
+CREATE INDEX zstd_fetch_lookup ON zstd_fetch(lookup_key);
+
+statement ok
+FORCE CHECKPOINT;
+
+statement ok
+SET force_compression = 'auto';
+
+query II rowsort
+SELECT column_name, lower(compression)
+FROM pragma_storage_info('batch_fetch')
+WHERE segment_type != 'VALIDITY'
+GROUP BY ALL;
+----
+dict_value	dict_fsst
+double_value	alprd
+group_key	bitpacking
+id	bitpacking
+packed_value	bitpacking
+rle_value	rle
+zstd_value	zstd
+
+query I
+SELECT min(segment_count) > 1
+FROM (SELECT column_name, count(*) AS segment_count
+      FROM pragma_storage_info('batch_fetch')
+      WHERE segment_type != 'VALIDITY'
+      GROUP BY column_name);
+----
+true
+
+query I
+SELECT bool_and(lower(compression) = 'alp')
+FROM pragma_storage_info('alp_fetch')
+WHERE column_name IN ('payload_float', 'payload_double') AND segment_type != 'VALIDITY';
+----
+true
+
+query I
+SELECT bool_and(lower(compression) = 'alprd')
+FROM pragma_storage_info('alprd_fetch')
+WHERE column_name IN ('payload_float', 'payload_double') AND segment_type != 'VALIDITY';
+----
+true
+
+query I
+SELECT bool_and(lower(compression) = 'zstd')
+FROM pragma_storage_info('zstd_fetch')
+WHERE column_name = 'payload' AND segment_type != 'VALIDITY';
+----
+true
+
+# Capture Sequential Scan results before enabling the ART path.
+statement ok
+SET GLOBAL index_scan_max_count = 0;
+
+statement ok
+SET GLOBAL index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_ranges AS
+SELECT upper_bound,
+       count(*) AS row_count,
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+FROM (VALUES (1), (10), (32), (64), (100), (1000), (2047), (2048), (2049), (10000), (100000)) limits(upper_bound)
+JOIN batch_fetch ON id <= upper_bound
+GROUP BY upper_bound;
+
+statement ok
+CREATE TEMP TABLE expected_100k AS
+SELECT * FROM batch_fetch WHERE id <= 100000;
+
+statement ok
+SET GLOBAL index_scan_max_count = 300000;
+
+statement ok
+SET GLOBAL index_scan_percentage = 1.0;
+
+foreach upper_bound 1 10 32 64 100 1000 2047 2048 2049 10000 100000
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+    FROM batch_fetch
+    WHERE id <= {upper_bound}
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_ranges expected
+WHERE expected.upper_bound = {upper_bound};
+----
+true
+
+endloop
+
+statement ok
+CREATE TEMP TABLE actual_100k AS
+SELECT * FROM batch_fetch WHERE id <= 100000;
+
+query I
+SELECT count(*)
+FROM ((SELECT * FROM actual_100k EXCEPT ALL SELECT * FROM expected_100k)
+      UNION ALL
+      (SELECT * FROM expected_100k EXCEPT ALL SELECT * FROM actual_100k));
+----
+0
+
+# Compare the explicitly forced ALP, ALPRD, and ZSTD payloads against Sequential Scan.
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_forced_codecs AS
+SELECT 'alp' AS codec, count(*) AS row_count, bit_xor(hash(id, payload_float, payload_double)) AS row_hash
+FROM alp_fetch
+WHERE id <= 100000
+UNION ALL
+SELECT 'alprd' AS codec, count(*) AS row_count, bit_xor(hash(id, payload_float, payload_double)) AS row_hash
+FROM alprd_fetch
+WHERE id <= 100000
+UNION ALL
+SELECT 'zstd' AS codec, count(*) AS row_count, bit_xor(hash(id, payload)) AS row_hash
+FROM zstd_fetch
+WHERE id <= 100000;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, payload_float, payload_double)) AS row_hash
+    FROM alp_fetch
+    WHERE id <= 100000
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_forced_codecs expected
+WHERE expected.codec = 'alp';
+----
+true
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, payload_float, payload_double)) AS row_hash
+    FROM alprd_fetch
+    WHERE id <= 100000
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_forced_codecs expected
+WHERE expected.codec = 'alprd';
+----
+true
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, payload)) AS row_hash
+    FROM zstd_fetch
+    WHERE id <= 100000
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_forced_codecs expected
+WHERE expected.codec = 'zstd';
+----
+true
+
+query II
+EXPLAIN ANALYZE SELECT * FROM alp_fetch WHERE id <= 100000;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+EXPLAIN ANALYZE SELECT * FROM alprd_fetch WHERE id <= 100000;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+EXPLAIN ANALYZE SELECT * FROM zstd_fetch WHERE id <= 100000;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+# Exercise repeated forward skips within and across ZSTD vectors.
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_zstd_sparse AS
+SELECT count(*) AS row_count,
+       bit_xor(hash(id, lookup_key, payload)) AS row_hash,
+       count(*) FILTER (WHERE payload IS NULL) AS null_count,
+       count(*) FILTER (WHERE payload = '') AS empty_count
+FROM zstd_fetch
+WHERE lookup_key = 0;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, lookup_key, payload)) AS row_hash,
+           count(*) FILTER (WHERE payload IS NULL) AS null_count,
+           count(*) FILTER (WHERE payload = '') AS empty_count
+    FROM zstd_fetch
+    WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count
+       AND actual.row_hash = expected.row_hash
+       AND actual.null_count = expected.null_count
+       AND actual.empty_count = expected.empty_count
+FROM actual, expected_zstd_sparse expected;
+----
+true
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM zstd_fetch WHERE lookup_key = 0;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+# Selected decode must preserve ALP/ALPRD special values across sparse vector hits.
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_alp_sparse AS
+SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload_float, payload_double)) AS row_hash
+FROM alp_fetch
+WHERE lookup_key = 0;
+
+statement ok
+CREATE TEMP TABLE expected_alprd_sparse AS
+SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload_float, payload_double)) AS row_hash
+FROM alprd_fetch
+WHERE lookup_key = 0;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload_float, payload_double)) AS row_hash
+    FROM alp_fetch
+    WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_alp_sparse expected;
+----
+true
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload_float, payload_double)) AS row_hash
+    FROM alprd_fetch
+    WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_alprd_sparse expected;
+----
+true
+
+query II
+EXPLAIN ANALYZE SELECT payload_float, payload_double FROM alp_fetch WHERE lookup_key = 0;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+EXPLAIN ANALYZE SELECT payload_float, payload_double FROM alprd_fetch WHERE lookup_key = 0;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+EXPLAIN ANALYZE SELECT * FROM batch_fetch WHERE id <= 100000;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+# Sparse row ids exercise forward skips within each column segment.
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_sparse AS
+SELECT count(*) AS row_count,
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+FROM batch_fetch
+WHERE group_key = 42;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+    FROM batch_fetch
+    WHERE group_key = 42
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_sparse expected;
+----
+true
+
+query II
+EXPLAIN ANALYZE SELECT * FROM batch_fetch WHERE group_key = 42;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+# Cross the default RowGroup boundary and retain NULLs in both string columns.
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TABLE expected_boundary AS
+SELECT count(*) AS row_count,
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash,
+       count(*) FILTER (WHERE dict_value IS NULL) AS dict_nulls,
+       count(*) FILTER (WHERE zstd_value IS NULL) AS zstd_nulls
+FROM batch_fetch
+WHERE id BETWEEN 122800 AND 122950;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash,
+           count(*) FILTER (WHERE dict_value IS NULL) AS dict_nulls,
+           count(*) FILTER (WHERE zstd_value IS NULL) AS zstd_nulls
+    FROM batch_fetch
+    WHERE id BETWEEN 122800 AND 122950
+)
+SELECT actual.row_count = expected.row_count
+       AND actual.row_hash = expected.row_hash
+       AND actual.dict_nulls = expected.dict_nulls
+       AND actual.zstd_nulls = expected.zstd_nulls
+FROM actual, expected_boundary expected;
+----
+true
+
+# Exercise the RowGroup boundary concurrently.
+concurrentloop threadid 0 4
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+    FROM batch_fetch
+    WHERE id BETWEEN 122800 AND 122950
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_boundary expected;
+----
+true
+
+endloop
+
+# Verify persisted segments after closing and reopening the database.
+restart
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+SELECT count(*) FROM batch_fetch WHERE id <= 100000;
+----
+100000
+
+query II
+EXPLAIN ANALYZE SELECT * FROM batch_fetch WHERE id <= 100000;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_zstd_sparse_after_restart AS
+SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload)) AS row_hash
+FROM zstd_fetch
+WHERE lookup_key = 0;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload)) AS row_hash
+    FROM zstd_fetch
+    WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_zstd_sparse_after_restart expected;
+----
+true
+
+# Base data is fetched in batches before committed updates are overlaid.
+statement ok
+UPDATE batch_fetch
+SET packed_value = -packed_value,
+    rle_value = -7,
+    double_value = -double_value,
+    dict_value = 'updated_dict',
+    zstd_value = 'updated_zstd'
+WHERE id BETWEEN 1000 AND 1099;
+
+query IIIII
+SELECT count(*), min(rle_value), max(rle_value), count(DISTINCT dict_value), count(DISTINCT zstd_value)
+FROM batch_fetch
+WHERE id BETWEEN 1000 AND 1099;
+----
+100	-7	-7	1	1
+
+# Transaction-local UPDATE and DELETE visibility must be identical for Scan and ART.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE batch_fetch
+SET dict_value = 'transaction_dict', zstd_value = NULL
+WHERE id BETWEEN 2000 AND 2099;
+
+statement ok
+DELETE FROM batch_fetch WHERE id IN (2001, 2003, 2005, 2007, 2009);
+
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET index_scan_percentage = 0;
+
+statement ok
+CREATE TEMP TABLE expected_transaction AS
+SELECT count(*) AS row_count,
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash,
+       count(*) FILTER (WHERE zstd_value IS NULL) AS zstd_nulls
+FROM batch_fetch
+WHERE id BETWEEN 1950 AND 2150;
+
+statement ok
+SET index_scan_max_count = 300000;
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash,
+           count(*) FILTER (WHERE zstd_value IS NULL) AS zstd_nulls
+    FROM batch_fetch
+    WHERE id BETWEEN 1950 AND 2150
+)
+SELECT actual.row_count = expected.row_count
+       AND actual.row_hash = expected.row_hash
+       AND actual.zstd_nulls = expected.zstd_nulls
+FROM actual, expected_transaction expected;
+----
+true
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT count(*), count(*) FILTER (WHERE dict_value = 'transaction_dict'),
+       count(*) FILTER (WHERE zstd_value IS NULL)
+FROM batch_fetch
+WHERE id BETWEEN 2000 AND 2099;
+----
+100	0	5
+
+# Mix transaction-local inserts with persisted rows returned by a non-unique ART.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO batch_fetch VALUES
+    (300001, 42, 1, 1, 1.5, 'local_dict_1', 'local_zstd_1'),
+    (300002, 42, 2, 2, 2.5, NULL, NULL);
+
+query IIII
+SELECT count(*), count(*) FILTER (WHERE id > 300000), min(id), max(id)
+FROM batch_fetch
+WHERE group_key = 42;
+----
+3095	2	42	300002
+
+query III
+SELECT id, dict_value, zstd_value
+FROM batch_fetch
+WHERE group_key = 42 AND id > 300000
+ORDER BY id;
+----
+300001	local_dict_1	local_zstd_1
+300002	NULL	NULL
+
+statement ok
+ROLLBACK;
+
+# Indexed DELETE uses FORCE_FETCH and must remain correct across many batches.
+statement ok
+DELETE FROM batch_fetch WHERE id BETWEEN 200000 AND 202500;
+
+query III
+SELECT count(*), count(*) FILTER (WHERE id = 199999), count(*) FILTER (WHERE id = 202501)
+FROM batch_fetch
+WHERE id BETWEEN 199999 AND 202501;
+----
+2	1	1
+
+# Concurrent updates and reads must see one complete UpdateSegment version.
+statement ok
+UPDATE batch_fetch
+SET packed_value = 0, rle_value = 0, double_value = 0,
+    dict_value = 'concurrent_0', zstd_value = 'concurrent_0'
+WHERE id BETWEEN 5000 AND 5099;
+
+statement ok
+SET GLOBAL index_scan_max_count = 300000;
+
+statement ok
+SET GLOBAL index_scan_percentage = 1.0;
+
+concurrentloop threadid 0 5
+
+loop i 0 20
+
+onlyif threadid=0
+statement ok
+UPDATE batch_fetch
+SET packed_value = {i} % 2,
+    rle_value = {i} % 2,
+    double_value = {i} % 2,
+    dict_value = 'concurrent_' || ({i} % 2)::VARCHAR,
+    zstd_value = 'concurrent_' || ({i} % 2)::VARCHAR
+WHERE id BETWEEN 5000 AND 5099;
+
+endloop
+
+loop i 0 40
+
+skipif threadid=0
+query I
+SELECT count(*) = 100
+       AND count(DISTINCT hash(packed_value, rle_value, double_value, dict_value, zstd_value)) = 1
+       AND bool_and(packed_value IN (0, 1)
+                    AND rle_value = packed_value
+                    AND double_value = packed_value
+                    AND dict_value = 'concurrent_' || packed_value::VARCHAR
+                    AND zstd_value = dict_value)
+FROM batch_fetch
+WHERE id BETWEEN 5000 AND 5099;
+----
+true
+
+endloop
+
+endloop
+
+# Concurrent readers use thread-local scan state for dense, sparse, and task-boundary fetches.
+statement ok
+SET GLOBAL index_scan_max_count = 0;
+
+statement ok
+SET GLOBAL index_scan_percentage = 0;
+
+statement ok
+CREATE TABLE concurrent_expected (workload VARCHAR, row_count BIGINT, row_hash UBIGINT);
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'batch_2047' AS workload, count(*) AS row_count,
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+FROM batch_fetch WHERE id <= 2047;
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'batch_2048', count(*),
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value))
+FROM batch_fetch WHERE id <= 2048;
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'batch_2049', count(*),
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value))
+FROM batch_fetch WHERE id <= 2049;
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'batch_sparse', count(*),
+       bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value))
+FROM batch_fetch WHERE group_key = 42 AND id <= 100000;
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'zstd_sparse', count(*), bit_xor(hash(id, lookup_key, payload))
+FROM zstd_fetch WHERE lookup_key = 0;
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'alp_sparse', count(*), bit_xor(hash(id, lookup_key, payload_float, payload_double))
+FROM alp_fetch WHERE lookup_key = 0;
+
+statement ok
+INSERT INTO concurrent_expected
+SELECT 'alprd_sparse', count(*), bit_xor(hash(id, lookup_key, payload_float, payload_double))
+FROM alprd_fetch WHERE lookup_key = 0;
+
+statement ok
+SET GLOBAL index_scan_max_count = 300000;
+
+statement ok
+SET GLOBAL index_scan_percentage = 1.0;
+
+concurrentloop threadid 0 4
+
+foreach upper_bound 2047 2048 2049
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+    FROM batch_fetch WHERE id <= {upper_bound}
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, concurrent_expected expected
+WHERE expected.workload = 'batch_{upper_bound}';
+----
+true
+
+endloop
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count,
+           bit_xor(hash(id, group_key, packed_value, rle_value, double_value, dict_value, zstd_value)) AS row_hash
+    FROM batch_fetch WHERE group_key = 42 AND id <= 100000
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, concurrent_expected expected
+WHERE expected.workload = 'batch_sparse';
+----
+true
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload)) AS row_hash
+    FROM zstd_fetch WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, concurrent_expected expected
+WHERE expected.workload = 'zstd_sparse';
+----
+true
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload_float, payload_double)) AS row_hash
+    FROM alp_fetch WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, concurrent_expected expected
+WHERE expected.workload = 'alp_sparse';
+----
+true
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, lookup_key, payload_float, payload_double)) AS row_hash
+    FROM alprd_fetch WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, concurrent_expected expected
+WHERE expected.workload = 'alprd_sparse';
+----
+true
+
+endloop

@@ -19,6 +19,8 @@
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 template <class T>
@@ -28,6 +30,13 @@ public:
 
 	void Reset() {
 		index = 0;
+	}
+
+	void ValidateExceptionsCount(idx_t vector_size) const {
+		if (exceptions_count > vector_size) {
+			throw DataCorruptionException("Corrupted ALPRD segment: exceptions_count (%d) exceeds vector_size (%d)",
+			                              exceptions_count, vector_size);
+		}
 	}
 
 	// Scan of the data itself
@@ -50,6 +59,63 @@ public:
 		                                       right_bit_width);
 	}
 
+	void DecodeSelected(const idx_t *offsets, idx_t fetch_count, idx_t vector_start, EXACT_TYPE *result) {
+		if (uncompressed_mode) {
+			for (idx_t i = 0; i < fetch_count; i++) {
+				const idx_t offset_in_vector = offsets[i] - vector_start;
+				result[i] = Load<EXACT_TYPE>(uncompressed_data + offset_in_vector * sizeof(EXACT_TYPE));
+			}
+			return;
+		}
+		uint16_t selected_exceptions[AlpRDConstants::ALP_VECTOR_SIZE] = {0};
+		bool is_exception[AlpRDConstants::ALP_VECTOR_SIZE] = {false};
+		for (idx_t exception_idx = 0; exception_idx < exceptions_count; exception_idx++) {
+			const idx_t exception_offset = vector_start + exceptions_positions[exception_idx];
+			const auto match = std::lower_bound(offsets, offsets + fetch_count, exception_offset);
+			if (match != offsets + fetch_count && *match == exception_offset) {
+				const idx_t result_idx = NumericCast<idx_t>(match - offsets);
+				selected_exceptions[result_idx] = exceptions[exception_idx];
+				is_exception[result_idx] = true;
+			}
+		}
+
+		BitpackingPrimitives::ForEachSelectedAlgorithmGroup(
+		    offsets, fetch_count, vector_start, [&](idx_t group_begin, idx_t group_end, idx_t group_start) {
+			    uint16_t left_group[BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE] = {0};
+			    EXACT_TYPE right_group[BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE] = {0};
+			    if (left_bit_width > 0) {
+				    BitpackingPrimitives::UnPackBlock<uint16_t>(
+				        data_ptr_cast(left_group), left_encoded + group_start * left_bit_width / 8, left_bit_width);
+			    }
+			    if (right_bit_width > 0) {
+				    BitpackingPrimitives::UnPackBlock<EXACT_TYPE>(
+				        data_ptr_cast(right_group), right_encoded + group_start * right_bit_width / 8, right_bit_width);
+			    }
+
+			    for (idx_t i = group_begin; i < group_end; i++) {
+				    const idx_t position = offsets[i] - vector_start;
+				    const idx_t group_offset = position - group_start;
+				    uint16_t left = selected_exceptions[i];
+				    if (!is_exception[i]) {
+					    const auto dictionary_index = left_group[group_offset];
+					    if (dictionary_index >= dictionary_size) {
+						    throw DataCorruptionException(
+						        "Corrupted ALPRD segment: dictionary index exceeds dictionary size");
+					    }
+					    left = left_parts_dict[dictionary_index];
+				    }
+				    if (right_bit_width == sizeof(EXACT_TYPE) * 8) {
+					    if (left != 0) {
+						    throw DataCorruptionException("Corrupted ALPRD segment: left part exceeds value width");
+					    }
+					    result[i] = right_group[group_offset];
+				    } else {
+					    result[i] = (static_cast<EXACT_TYPE>(left) << right_bit_width) | right_group[group_offset];
+				    }
+			    }
+		    });
+	}
+
 public:
 	idx_t index;
 	uint8_t left_encoded[AlpRDConstants::ALP_VECTOR_SIZE * 8];
@@ -61,6 +127,9 @@ public:
 	uint8_t right_bit_width;
 	uint8_t left_bit_width;
 	uint16_t left_parts_dict[AlpRDConstants::MAX_DICTIONARY_SIZE];
+	uint8_t dictionary_size;
+	bool uncompressed_mode;
+	data_ptr_t uncompressed_data;
 };
 
 template <class T>
@@ -98,6 +167,10 @@ public:
 
 		vector_state.left_bit_width = Load<uint8_t>(segment_ptr);
 		segment_ptr += AlpRDConstants::LEFT_BIT_WIDTH_SIZE;
+		if (vector_state.right_bit_width > sizeof(EXACT_TYPE) * 8 ||
+		    vector_state.left_bit_width > sizeof(uint16_t) * 8) {
+			throw DataCorruptionException("Corrupted ALPRD segment: bit width exceeds value width");
+		}
 
 		uint8_t actual_dictionary_size = Load<uint8_t>(segment_ptr);
 		segment_ptr += AlpRDConstants::N_DICTIONARY_ELEMENTS_SIZE;
@@ -107,6 +180,7 @@ public:
 		if (actual_dictionary_size > AlpRDConstants::MAX_DICTIONARY_SIZE) {
 			throw DataCorruptionException("Corrupt database file: ALPRD dictionary size exceeds maximum");
 		}
+		vector_state.dictionary_size = actual_dictionary_size;
 		idx_t actual_dictionary_size_bytes =
 		    static_cast<idx_t>(actual_dictionary_size) * AlpRDConstants::DICTIONARY_ELEMENT_SIZE;
 
@@ -164,8 +238,7 @@ public:
 		total_value_count += vector_size;
 	}
 
-	template <bool SKIP = false>
-	void LoadVector(EXACT_TYPE *value_buffer) {
+	idx_t LoadVectorData() {
 		vector_state.Reset();
 
 		// Load the offset (metadata) indicating where the vector data starts
@@ -186,23 +259,18 @@ public:
 		vector_state.exceptions_count = Load<uint16_t>(vector_ptr);
 		vector_ptr += AlpRDConstants::EXCEPTIONS_COUNT_SIZE;
 
-		const bool uncompressed_mode = vector_state.exceptions_count == AlpRDConstants::UNCOMPRESSED_MODE_SENTINEL;
-		if (uncompressed_mode) {
-			if (!SKIP) {
-				// Read uncompressed values
-				const idx_t value_buffer_copy_size = sizeof(T) * vector_size;
-				if (vector_ptr + value_buffer_copy_size > segment_data + block_size) {
-					const auto bytes_remaining_in_block = (segment_data + block_size) - vector_ptr;
-					throw DataCorruptionException(
-					    "Corrupted ALPRD segment: stored vector_size is invalid, to-copy bytes "
-					    "(%d) would exceed bytes remaining in the block (%d)",
-					    value_buffer_copy_size, bytes_remaining_in_block);
-				}
-				memcpy(value_buffer, vector_ptr, value_buffer_copy_size);
+		vector_state.uncompressed_mode = vector_state.exceptions_count == AlpRDConstants::UNCOMPRESSED_MODE_SENTINEL;
+		if (vector_state.uncompressed_mode) {
+			const idx_t value_buffer_copy_size = sizeof(T) * vector_size;
+			if (vector_ptr + value_buffer_copy_size > segment_data + block_size) {
+				const auto bytes_remaining_in_block = (segment_data + block_size) - vector_ptr;
+				throw DataCorruptionException("Corrupted ALPRD segment: stored vector_size is invalid, to-copy bytes "
+				                              "(%d) would exceed bytes remaining in the block (%d)",
+				                              value_buffer_copy_size, bytes_remaining_in_block);
 			}
-			return;
+			vector_state.uncompressed_data = vector_ptr;
+			return vector_size;
 		}
-
 		auto left_bp_size = BitpackingPrimitives::GetRequiredSize(vector_size, vector_state.left_bit_width);
 		auto right_bp_size = BitpackingPrimitives::GetRequiredSize(vector_size, vector_state.right_bit_width);
 
@@ -231,6 +299,7 @@ public:
 			    data_byte_offset + read_bytes + exceptions_copy_size > block_size) {
 				throw DataCorruptionException("Corrupted ALPRD segment: exceptions payload too large");
 			}
+			vector_state.ValidateExceptionsCount(vector_size);
 			memcpy(vector_state.exceptions, (void *)vector_ptr, exceptions_copy_size);
 			vector_ptr += exceptions_copy_size;
 			read_bytes += exceptions_copy_size;
@@ -256,8 +325,40 @@ public:
 			}
 		}
 
-		// Decode all the vector values to the specified 'value_buffer'
+		return vector_size;
+	}
+
+	template <bool SKIP = false>
+	void LoadVector(EXACT_TYPE *value_buffer) {
+		const idx_t vector_size = LoadVectorData();
+		if (vector_state.uncompressed_mode) {
+			if (!SKIP) {
+				memcpy(value_buffer, vector_state.uncompressed_data, sizeof(T) * vector_size);
+			}
+			return;
+		}
 		vector_state.template LoadValues<SKIP>(value_buffer, vector_size);
+	}
+
+	void FetchRows(const idx_t *offsets, idx_t fetch_count, EXACT_TYPE *result) {
+		idx_t fetch_idx = 0;
+		while (fetch_idx < fetch_count) {
+			const idx_t vector_idx = offsets[fetch_idx] / AlpRDConstants::ALP_VECTOR_SIZE;
+			while (total_value_count / AlpRDConstants::ALP_VECTOR_SIZE < vector_idx) {
+				SkipVector();
+			}
+
+			const idx_t vector_start = total_value_count;
+			const idx_t vector_size = LoadVectorData();
+			idx_t vector_fetch_end = fetch_idx + 1;
+			while (vector_fetch_end < fetch_count && offsets[vector_fetch_end] < vector_start + vector_size) {
+				vector_fetch_end++;
+			}
+			vector_state.DecodeSelected(offsets + fetch_idx, vector_fetch_end - fetch_idx, vector_start,
+			                            result + fetch_idx);
+			total_value_count += vector_size;
+			fetch_idx = vector_fetch_end;
+		}
 	}
 
 public:
@@ -325,6 +426,22 @@ void AlpRDSkip(ColumnSegment &segment, ColumnScanState &state, idx_t skip_count)
 template <class T>
 void AlpRDScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result) {
 	AlpRDScanPartial<T>(segment, state, scan_count, result, 0);
+}
+
+template <class T>
+void AlpRDFetchRows(ColumnSegment &segment, ColumnFetchState &state, const idx_t *offsets, idx_t fetch_count,
+                    Vector &result, idx_t result_offset) {
+	D_ASSERT(fetch_count > 1);
+	const bool consecutive = offsets[fetch_count - 1] - offsets[0] == fetch_count - 1;
+	if (consecutive) {
+		ColumnSegment::FetchRowsUsingScan(segment, state, offsets, fetch_count, result, result_offset);
+		return;
+	}
+
+	using EXACT_TYPE = typename FloatingToExact<T>::TYPE;
+	auto result_data = FlatVector::GetDataMutableUnsafe<EXACT_TYPE>(result);
+	AlpRDScanState<T> scan_state(segment);
+	scan_state.FetchRows(offsets, fetch_count, result_data + result_offset);
 }
 
 } // namespace duckdb

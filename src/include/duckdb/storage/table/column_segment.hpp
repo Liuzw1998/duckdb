@@ -70,6 +70,12 @@ public:
 	            const TableFilter &filter, TableFilterState &filter_state);
 	//! Fetch a value of the specific row id and append it to the result
 	void FetchRow(ColumnFetchState &state, row_t row_id, Vector &result, idx_t result_idx);
+	//! Fetch segment-relative row offsets into consecutive result positions, bounded by the segment and result capacity
+	void FetchRows(ColumnFetchState &state, const idx_t *offsets, idx_t fetch_count, Vector &result,
+	               idx_t result_offset);
+	//! Batch fetch implementation for codecs that can reuse their scan state; count is independent of vector size
+	static void FetchRowsUsingScan(ColumnSegment &segment, ColumnFetchState &state, const idx_t *offsets,
+	                               idx_t fetch_count, Vector &result, idx_t result_offset);
 
 	[[deprecated("UnifiedVectorFormat parameter is ignored")]] static idx_t
 	FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata, const TableFilter &filter,

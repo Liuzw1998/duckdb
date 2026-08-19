@@ -16,19 +16,22 @@ foreach bitpacking_mode delta_for for constant_delta constant
 statement ok
 PRAGMA force_bitpacking_mode='{bitpacking_mode}'
 
-foreach type INTEGER UINT16
+foreach type INTEGER UINT16 BIGINT UBIGINT HUGEINT UHUGEINT
 
 statement ok
-CREATE TABLE test(id INTEGER PRIMARY KEY, col {type})
+CREATE TABLE test(id INTEGER PRIMARY KEY, lookup_key INTEGER, col {type})
 
 statement ok
-INSERT INTO test SELECT i::VARCHAR id, i b FROM range(10000) tbl(i)
+INSERT INTO test SELECT i::VARCHAR id, i % 8 lookup_key, i b FROM range(10000) tbl(i)
 
 statement ok
-INSERT INTO test SELECT i::VARCHAR id, 1337 FROM range(10000, 20000) tbl(i)
+INSERT INTO test SELECT i::VARCHAR id, i % 8 lookup_key, 1337 FROM range(10000, 20000) tbl(i)
 
 statement ok
-INSERT INTO test SELECT i::VARCHAR id, i b FROM range(20000, 30000) tbl(i)
+INSERT INTO test SELECT i::VARCHAR id, i % 8 lookup_key, i b FROM range(20000, 30000) tbl(i)
+
+statement ok
+CREATE INDEX test_lookup_idx ON test(lookup_key)
 
 statement ok
 CHECKPOINT
@@ -53,10 +56,46 @@ SELECT MIN(id), MAX(id), SUM(col), MIN(col), MAX(col), COUNT(*) FROM test WHERE 
 22000	22000	22000	22000	22000	1
 
 statement ok
+SET index_scan_max_count = 0
+
+statement ok
+SET index_scan_percentage = 0
+
+statement ok
+CREATE TEMP TABLE expected_sparse AS
+SELECT count(*) AS row_count, bit_xor(hash(id, col)) AS row_hash
+FROM test
+WHERE lookup_key = 0
+
+statement ok
+SET index_scan_max_count = 30000
+
+statement ok
+SET index_scan_percentage = 1.0
+
+query I
+WITH actual AS (
+    SELECT count(*) AS row_count, bit_xor(hash(id, col)) AS row_hash
+    FROM test
+    WHERE lookup_key = 0
+)
+SELECT actual.row_count = expected.row_count AND actual.row_hash = expected.row_hash
+FROM actual, expected_sparse expected
+----
+true
+
+query II
+EXPLAIN ANALYZE SELECT id, col FROM test WHERE lookup_key = 0
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+statement ok
+DROP TABLE expected_sparse
+
+statement ok
 DROP TABLE test;
 
 endloop
 
 endloop
-
 

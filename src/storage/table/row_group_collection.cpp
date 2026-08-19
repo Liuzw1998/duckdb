@@ -535,6 +535,8 @@ void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, c
 	sel_t visible_sel_buffer[STANDARD_VECTOR_SIZE];
 	// Filter selection vector.
 	SelectionVector filter_sel(visible_sel_buffer, STANDARD_VECTOR_SIZE);
+	// Visible row positions after applying the filter selection.
+	idx_t visible_offsets[STANDARD_VECTOR_SIZE];
 
 	idx_t pos = 0;
 	while (pos < fetch_count) {
@@ -570,24 +572,35 @@ void RowGroupCollection::Fetch(TransactionData transaction, DataChunk &result, c
 
 		// 3. bulk visibility check for the whole run.
 		idx_t visible_count = 0;
-		const_reference<SelectionVector> sel_for_fetch(*FlatVector::IncrementalSelectionVector());
 		if (state.fetch_type == FetchType::FORCE_FETCH) {
 			visible_count = run_count;
 		} else {
 			visible_count = current_row_group.Fetch(transaction, offsets, run_count, filter_sel);
-			if (visible_count != run_count) {
-				sel_for_fetch = filter_sel;
-			}
+		}
+		if (visible_count > run_count) {
+			throw InternalException("RowGroupCollection::Fetch - visible count exceeds source offset count");
 		}
 
 		if (visible_count == 0) {
 			continue;
 		}
 
-		// 4. bulk per-column fetch
+		// 4. Compact a non-identity visibility selection once before fetching projected columns.
+		const idx_t *fetch_offsets = offsets;
+		if (visible_count != run_count) {
+			for (idx_t visible_idx = 0; visible_idx < visible_count; visible_idx++) {
+				const idx_t selected_idx = filter_sel.get_index(visible_idx);
+				if (selected_idx >= run_count) {
+					throw InternalException("RowGroupCollection::Fetch - visibility selection index out of range");
+				}
+				visible_offsets[visible_idx] = offsets[selected_idx];
+			}
+			fetch_offsets = visible_offsets;
+		}
+
+		// 5. bulk per-column fetch
 		state.row_group = row_group;
-		current_row_group.FetchRows(transaction, state, column_ids, offsets, sel_for_fetch.get(), visible_count, result,
-		                            count);
+		current_row_group.FetchRows(transaction, state, column_ids, fetch_offsets, visible_count, result, count);
 		count += visible_count;
 	}
 	result.SetChildCardinality(count);

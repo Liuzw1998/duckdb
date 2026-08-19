@@ -116,13 +116,12 @@ idx_t RowIdColumnData::Fetch(ColumnScanState &state, row_t row_id, Vector &resul
 }
 
 void RowIdColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state, const StorageIndex &storage_index,
-                                const idx_t *offsets, const SelectionVector &sel, idx_t fetch_count, Vector &result,
-                                idx_t result_offset) {
+                                const idx_t *offsets, idx_t fetch_count, Vector &result, idx_t result_offset) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto data = FlatVector::GetDataMutable<row_t>(result);
 	auto row_start = state.row_group->GetRowStart();
 	for (idx_t idx = 0; idx < fetch_count; idx++) {
-		data[result_offset + idx] = NumericCast<row_t>(row_start + offsets[sel.get_index(idx)]);
+		data[result_offset + idx] = NumericCast<row_t>(row_start + offsets[idx]);
 	}
 }
 

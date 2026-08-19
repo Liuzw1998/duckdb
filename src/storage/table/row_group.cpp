@@ -1147,9 +1147,8 @@ idx_t RowGroup::Fetch(TransactionData transaction, const idx_t *offsets, idx_t f
 }
 
 void RowGroup::FetchRows(TransactionData transaction, ColumnFetchState &state, const vector<StorageIndex> &column_ids,
-                         const idx_t *offsets, const SelectionVector &visible_sel, idx_t visible_count,
-                         DataChunk &result, idx_t result_offset) {
-	if (visible_count == 0) {
+                         const idx_t *offsets, idx_t fetch_count, DataChunk &result, idx_t result_offset) {
+	if (fetch_count == 0) {
 		return;
 	}
 
@@ -1158,8 +1157,7 @@ void RowGroup::FetchRows(TransactionData transaction, ColumnFetchState &state, c
 		auto &result_vector = result.data[col_idx];
 		D_ASSERT(result_vector.GetVectorType() == VectorType::FLAT_VECTOR);
 		auto &col_data = GetColumn(column);
-		col_data.FetchRows(transaction, state, column, offsets, visible_sel, visible_count, result_vector,
-		                   result_offset);
+		col_data.FetchRows(transaction, state, column, offsets, fetch_count, result_vector, result_offset);
 	}
 }
 

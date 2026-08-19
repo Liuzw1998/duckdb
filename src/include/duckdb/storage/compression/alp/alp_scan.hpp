@@ -17,6 +17,8 @@
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 template <class T>
@@ -45,6 +47,55 @@ public:
 		                                     exceptions, exceptions_positions, frame_of_reference, bit_width);
 	}
 
+	void DecodeSelected(const idx_t *offsets, idx_t fetch_count, idx_t vector_start, T *result) {
+		if (uncompressed_mode) {
+			for (idx_t i = 0; i < fetch_count; i++) {
+				const idx_t offset_in_vector = offsets[i] - vector_start;
+				result[i] = Load<T>(uncompressed_data + offset_in_vector * sizeof(T));
+			}
+			return;
+		}
+		ValidateEncoding();
+
+		const alp::AlpEncodingIndices encoding_indices = {v_exponent, v_factor};
+		BitpackingPrimitives::ForEachSelectedAlgorithmGroup(
+		    offsets, fetch_count, vector_start, [&](idx_t group_begin, idx_t group_end, idx_t group_start) {
+			    uint64_t decoded_group[BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE] = {0};
+			    if (bit_width > 0) {
+				    BitpackingPrimitives::UnPackBlock<uint64_t>(
+				        data_ptr_cast(decoded_group), for_encoded + group_start * bit_width / 8, bit_width, true);
+			    }
+			    for (idx_t i = group_begin; i < group_end; i++) {
+				    const idx_t group_offset = offsets[i] - vector_start - group_start;
+				    const auto encoded_integer = static_cast<int64_t>(decoded_group[group_offset] + frame_of_reference);
+				    result[i] = alp::AlpCompression<T, true>::DecodeValue(encoded_integer, encoding_indices);
+			    }
+		    });
+
+		for (idx_t i = 0; i < exceptions_count; i++) {
+			const idx_t exception_offset = vector_start + exceptions_positions[i];
+			const auto match = std::lower_bound(offsets, offsets + fetch_count, exception_offset);
+			if (match != offsets + fetch_count && *match == exception_offset) {
+				result[NumericCast<idx_t>(match - offsets)] = exceptions[i];
+			}
+		}
+	}
+
+	void ValidateEncoding() const {
+		constexpr idx_t exponent_count = sizeof(AlpTypedConstants<T>::FRAC_ARR) / sizeof(T);
+		constexpr idx_t factor_count = sizeof(AlpConstants::FACT_ARR) / sizeof(int64_t);
+		if (v_exponent >= exponent_count || v_factor >= factor_count) {
+			throw DataCorruptionException("Corrupted ALP segment: exponent or factor is out of range");
+		}
+		if (v_factor > v_exponent) {
+			throw DataCorruptionException("Corrupted ALP segment: v_factor (%d) exceeds v_exponent (%d)", v_factor,
+			                              v_exponent);
+		}
+		if (bit_width > sizeof(uint64_t) * 8) {
+			throw DataCorruptionException("Corrupted ALP segment: Invalid bit_width encountered: %d", bit_width);
+		}
+	}
+
 public:
 	idx_t index;
 	T decoded_values[AlpConstants::ALP_VECTOR_SIZE];
@@ -56,6 +107,8 @@ public:
 	uint16_t exceptions_count;
 	uint64_t frame_of_reference;
 	uint8_t bit_width;
+	bool uncompressed_mode;
+	data_ptr_t uncompressed_data;
 };
 
 template <class T>
@@ -118,8 +171,7 @@ public:
 		total_value_count += vector_size;
 	}
 
-	template <bool SKIP = false>
-	void LoadVector(T *value_buffer) {
+	idx_t LoadVectorData() {
 		vector_state.Reset();
 
 		// Load the offset (metadata) indicating where the vector data starts
@@ -141,21 +193,18 @@ public:
 		vector_state.v_exponent = Load<uint8_t>(vector_ptr);
 		vector_ptr += AlpConstants::EXPONENT_SIZE;
 
-		const bool uncompressed_mode = vector_state.v_exponent == AlpConstants::UNCOMPRESSED_MODE_SENTINEL;
-		if (uncompressed_mode) {
-			if (!SKIP) {
-				// Read uncompressed values
-				const idx_t value_buffer_copy_size = sizeof(T) * vector_size;
-				if (vector_ptr + value_buffer_copy_size > segment_data + block_size) {
-					const auto bytes_remaining_in_block = (segment_data + block_size) - vector_ptr;
-					throw DataCorruptionException(
-					    "Corrupted ALP segment: stored vector_size is invalid, to-copy bytes (%d) "
-					    "would exceed bytes remaining in the block (%d)",
-					    value_buffer_copy_size, bytes_remaining_in_block);
-				}
-				memcpy(value_buffer, vector_ptr, value_buffer_copy_size);
+		vector_state.uncompressed_mode = vector_state.v_exponent == AlpConstants::UNCOMPRESSED_MODE_SENTINEL;
+		if (vector_state.uncompressed_mode) {
+			const idx_t value_buffer_copy_size = sizeof(T) * vector_size;
+			if (vector_ptr + value_buffer_copy_size > segment_data + block_size) {
+				const auto bytes_remaining_in_block = (segment_data + block_size) - vector_ptr;
+				throw DataCorruptionException(
+				    "Corrupted ALP segment: stored vector_size is invalid, to-copy bytes (%d) "
+				    "would exceed bytes remaining in the block (%d)",
+				    value_buffer_copy_size, bytes_remaining_in_block);
 			}
-			return;
+			vector_state.uncompressed_data = vector_ptr;
+			return vector_size;
 		}
 		vector_state.v_factor = Load<uint8_t>(vector_ptr);
 		vector_ptr += AlpConstants::FACTOR_SIZE;
@@ -173,15 +222,7 @@ public:
 			throw DataCorruptionException("Corrupted ALP segment: exceptions_count (%d) exceeds vector_size (%d)",
 			                              vector_state.exceptions_count, vector_size);
 		}
-		if (vector_state.v_factor > vector_state.v_exponent) {
-			throw DataCorruptionException("Corrupted ALP segment: v_factor (%d) exceeds v_exponent (%d)",
-			                              vector_state.v_factor, vector_state.v_exponent);
-		}
-		if (vector_state.bit_width > sizeof(uint64_t) * 8) {
-			throw DataCorruptionException("Corrupted ALP segment: Invalid bit_width encountered: %d",
-			                              vector_state.bit_width);
-		}
-
+		vector_state.ValidateEncoding();
 		idx_t read_bytes = 0;
 		if (vector_state.bit_width > 0) {
 			auto bp_size = BitpackingPrimitives::GetRequiredSize(vector_size, vector_state.bit_width);
@@ -228,8 +269,40 @@ public:
 			}
 		}
 
-		// Decode all the vector values to the specified 'value_buffer'
+		return vector_size;
+	}
+
+	template <bool SKIP = false>
+	void LoadVector(T *value_buffer) {
+		const idx_t vector_size = LoadVectorData();
+		if (vector_state.uncompressed_mode) {
+			if (!SKIP) {
+				memcpy(value_buffer, vector_state.uncompressed_data, sizeof(T) * vector_size);
+			}
+			return;
+		}
 		vector_state.template LoadValues<SKIP>(value_buffer, vector_size);
+	}
+
+	void FetchRows(const idx_t *offsets, idx_t fetch_count, T *result) {
+		idx_t fetch_idx = 0;
+		while (fetch_idx < fetch_count) {
+			const idx_t vector_idx = offsets[fetch_idx] / AlpConstants::ALP_VECTOR_SIZE;
+			while (total_value_count / AlpConstants::ALP_VECTOR_SIZE < vector_idx) {
+				SkipVector();
+			}
+
+			const idx_t vector_start = total_value_count;
+			const idx_t vector_size = LoadVectorData();
+			idx_t vector_fetch_end = fetch_idx + 1;
+			while (vector_fetch_end < fetch_count && offsets[vector_fetch_end] < vector_start + vector_size) {
+				vector_fetch_end++;
+			}
+			vector_state.DecodeSelected(offsets + fetch_idx, vector_fetch_end - fetch_idx, vector_start,
+			                            result + fetch_idx);
+			total_value_count += vector_size;
+			fetch_idx = vector_fetch_end;
+		}
 	}
 
 public:
@@ -296,6 +369,21 @@ void AlpSkip(ColumnSegment &segment, ColumnScanState &state, idx_t skip_count) {
 template <class T>
 void AlpScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result) {
 	AlpScanPartial<T>(segment, state, scan_count, result, 0);
+}
+
+template <class T>
+void AlpFetchRows(ColumnSegment &segment, ColumnFetchState &state, const idx_t *offsets, idx_t fetch_count,
+                  Vector &result, idx_t result_offset) {
+	D_ASSERT(fetch_count > 1);
+	const bool consecutive = offsets[fetch_count - 1] - offsets[0] == fetch_count - 1;
+	if (consecutive) {
+		ColumnSegment::FetchRowsUsingScan(segment, state, offsets, fetch_count, result, result_offset);
+		return;
+	}
+
+	auto result_data = FlatVector::GetDataMutable<T>(result);
+	AlpScanState<T> scan_state(segment);
+	scan_state.FetchRows(offsets, fetch_count, result_data + result_offset);
 }
 
 } // namespace duckdb

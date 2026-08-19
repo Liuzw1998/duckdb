@@ -4,9 +4,20 @@
 #include "fsst.h"
 #include "duckdb/common/fsst.hpp"
 #include "duckdb/common/vector/dictionary_vector.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 namespace dict_fsst {
+
+static constexpr idx_t DICTIONARY_INDEX_WINDOW_SIZE = 2048;
+static constexpr idx_t SMALL_DICTIONARY_SIZE = 64;
+
+static void ThrowInvalidDictionarySize() {
+	throw IOException("Failed to scan DICT_FSST string segment: dictionary size was out of range. Database file "
+	                  "appears to be corrupted.");
+}
 
 CompressedStringScanState::~CompressedStringScanState() {
 	delete reinterpret_cast<duckdb_fsst_decoder_t *>(decoder);
@@ -38,13 +49,16 @@ string_t CompressedStringScanState::FetchStringFromDict(Vector &result, uint32_t
 		}
 	}
 	default:
-		// FIXME: the Vector doesn't seem to take ownership of the non-inlined string data???
-		return string_t(str_ptr, string_len);
+		return StringVector::AddString(result, str_ptr, string_len);
 	}
 }
 
 void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	baseptr = handle->GetDataMutable() + segment.GetBlockOffset();
+	const auto &stats = segment.GetStats();
+	if (stats.GetStatsType() == StatisticsType::STRING_STATS && StringStats::HasMaxStringLength(stats)) {
+		all_values_inlined = StringStats::MaxStringLength(stats) <= string_t::INLINE_LENGTH;
+	}
 
 	// Load header values
 	auto header_ptr = reinterpret_cast<dict_fsst_compression_header_t *>(baseptr);
@@ -188,6 +202,124 @@ void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_of
 			}
 			result_data.WriteStringRef(FetchStringFromDict(result, decompress_offset, string_number));
 		}
+	}
+	result.Verify();
+}
+
+void CompressedStringScanState::FetchRows(Vector &result, idx_t result_offset, const idx_t *offsets,
+                                          idx_t fetch_count) {
+	D_ASSERT(fetch_count > 1);
+	auto result_data = FlatVector::Writer<string_t>(result, fetch_count, result_offset);
+	if (mode == DictFSSTMode::FSST_ONLY) {
+		for (idx_t fetch_idx = 0; fetch_idx < fetch_count; fetch_idx++) {
+			const idx_t string_number = offsets[fetch_idx] + 1;
+			if (DUCKDB_UNLIKELY(string_number >= dict_count)) {
+				throw IOException("Failed to scan DICT_FSST string segment: dictionary index was out of range. "
+				                  "Database file appears to be corrupted.");
+			}
+			D_ASSERT(decompress_position <= string_number);
+			for (; decompress_position < string_number; decompress_position++) {
+				const uint64_t next_offset =
+				    NumericCast<uint64_t>(decompress_offset) + string_lengths[decompress_position];
+				if (DUCKDB_UNLIKELY(next_offset > dictionary_size)) {
+					ThrowInvalidDictionarySize();
+				}
+				decompress_offset = NumericCast<uint32_t>(next_offset);
+			}
+			if (DUCKDB_UNLIKELY(NumericCast<uint64_t>(decompress_offset) + string_lengths[string_number] >
+			                    dictionary_size)) {
+				ThrowInvalidDictionarySize();
+			}
+			result_data.WriteStringRef(FetchStringFromDict(result, decompress_offset, string_number));
+		}
+		result.Verify();
+		return;
+	}
+
+	auto for_each_string_number = [&](auto &&callback) {
+		idx_t fetch_idx = 0;
+		while (fetch_idx < fetch_count) {
+			const idx_t window_start = offsets[fetch_idx];
+			idx_t window_end = fetch_idx + 1;
+			while (window_end < fetch_count && offsets[window_end] - window_start < DICTIONARY_INDEX_WINDOW_SIZE) {
+				window_end++;
+			}
+
+			const idx_t window_count = offsets[window_end - 1] - window_start + 1;
+			auto &selvec = GetSelVec(window_start, window_count);
+			for (; fetch_idx < window_end; fetch_idx++) {
+				const idx_t string_number = selvec.get_index(offsets[fetch_idx] - window_start);
+				if (DUCKDB_UNLIKELY(string_number >= dict_count)) {
+					throw IOException("Failed to scan DICT_FSST string segment: dictionary index was out of range. "
+					                  "Database file appears to be corrupted.");
+				}
+				callback(fetch_idx, string_number);
+			}
+		}
+	};
+
+	// Materializing a small offset table is cheaper than sorting selected dictionary indices.
+	if (dict_count <= SMALL_DICTIONARY_SIZE) {
+		vector<uint32_t> dictionary_offsets(dict_count);
+		uint64_t dictionary_offset = 0;
+		for (idx_t dictionary_idx = 0; dictionary_idx < dict_count; dictionary_idx++) {
+			dictionary_offsets[dictionary_idx] = NumericCast<uint32_t>(dictionary_offset);
+			dictionary_offset += string_lengths[dictionary_idx];
+			if (DUCKDB_UNLIKELY(dictionary_offset > dictionary_size)) {
+				ThrowInvalidDictionarySize();
+			}
+		}
+		if (DUCKDB_UNLIKELY(dictionary_offset != dictionary_size)) {
+			ThrowInvalidDictionarySize();
+		}
+		for_each_string_number([&](idx_t, idx_t string_number) {
+			if (string_number == 0) {
+				result_data.WriteNull();
+			} else {
+				result_data.WriteStringRef(
+				    FetchStringFromDict(result, dictionary_offsets[string_number], string_number));
+			}
+		});
+		result.Verify();
+		return;
+	}
+
+	vector<idx_t> string_numbers(fetch_count);
+	for_each_string_number([&](idx_t fetch_idx, idx_t string_number) { string_numbers[fetch_idx] = string_number; });
+
+	vector<idx_t> fetch_order(fetch_count);
+	for (idx_t idx = 0; idx < fetch_count; idx++) {
+		fetch_order[idx] = idx;
+	}
+	std::sort(fetch_order.begin(), fetch_order.end(),
+	          [&](idx_t left, idx_t right) { return string_numbers[left] < string_numbers[right]; });
+
+	vector<uint32_t> dictionary_offsets(fetch_count);
+	uint64_t dictionary_offset = 0;
+	idx_t dictionary_idx = 0;
+	for (const auto ordered_idx : fetch_order) {
+		const idx_t string_number = string_numbers[ordered_idx];
+		while (dictionary_idx < string_number) {
+			dictionary_offset += string_lengths[dictionary_idx++];
+			if (DUCKDB_UNLIKELY(dictionary_offset > dictionary_size)) {
+				ThrowInvalidDictionarySize();
+			}
+		}
+		const uint64_t string_end = dictionary_offset + string_lengths[string_number];
+		if (DUCKDB_UNLIKELY(string_end > dictionary_size ||
+		                    (string_number + 1 == dict_count && string_end != dictionary_size))) {
+			ThrowInvalidDictionarySize();
+		}
+		dictionary_offsets[ordered_idx] = NumericCast<uint32_t>(dictionary_offset);
+	}
+
+	for (idx_t fetch_idx = 0; fetch_idx < fetch_count; fetch_idx++) {
+		const idx_t string_number = string_numbers[fetch_idx];
+		if (string_number == 0) {
+			result_data.WriteNull();
+			continue;
+		}
+		result_data.WriteStringRef(FetchStringFromDict(result, dictionary_offsets[fetch_idx], string_number));
 	}
 	result.Verify();
 }

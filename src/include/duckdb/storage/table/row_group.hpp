@@ -171,11 +171,9 @@ public:
 	//! Bulk visibility check. For each offset in [0, count), writes the input index into `visible_sel` if that row is
 	//! visible to the transaction. Returns the number of visible rows.
 	idx_t Fetch(TransactionData transaction, const idx_t *offsets, idx_t count, SelectionVector &visible_sel);
-	//! Bulk row fetch. For each `i` in [0, visible_count), fetches the row at `offsets[visible_sel.get_index(i)]`
-	//! and writes every requested column into `result.data[col_idx][result_offset + i]`.
+	//! Bulk row fetch. The offsets have already been compacted to visible rows.
 	void FetchRows(TransactionData transaction, ColumnFetchState &state, const vector<StorageIndex> &column_ids,
-	               const idx_t *offsets, const SelectionVector &visible_sel, idx_t visible_count, DataChunk &result,
-	               idx_t result_offset);
+	               const idx_t *offsets, idx_t fetch_count, DataChunk &result, idx_t result_offset);
 
 	//! Append count rows to the version info
 	void AppendVersionInfo(TransactionData transaction, idx_t count);

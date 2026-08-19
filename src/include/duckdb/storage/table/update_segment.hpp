@@ -42,8 +42,7 @@ public:
 	void FetchCommittedRange(idx_t start_row, idx_t count, Vector &result);
 	void Update(TransactionData transaction, DuckTableEntry &table_entry, idx_t column_index, Vector &update,
 	            row_t *ids, idx_t count, Vector &base_data, idx_t row_group_start);
-	void FetchRows(TransactionData transaction, const idx_t *offsets, const SelectionVector &sel, idx_t count,
-	               Vector &result, idx_t result_offset);
+	void FetchRows(TransactionData transaction, const idx_t *offsets, idx_t count, Vector &result, idx_t result_offset);
 
 	void RollbackUpdate(UpdateInfo &info);
 	void CleanupUpdateInternal(const StorageLockKey &lock, UpdateInfo &info);
@@ -80,8 +79,8 @@ public:
 	typedef void (*fetch_committed_range_function_t)(UpdateInfo &info, idx_t start, idx_t end, idx_t result_offset,
 	                                                 Vector &result);
 	typedef void (*fetch_rows_function_t)(transaction_t start_time, transaction_t transaction_id, UpdateInfo &info,
-	                                      const idx_t *offsets, const SelectionVector &sel, idx_t fetch_offset,
-	                                      idx_t count, idx_t vector_offset, Vector &result, idx_t result_offset);
+	                                      const idx_t *offsets, idx_t fetch_offset, idx_t count, idx_t vector_offset,
+	                                      Vector &result, idx_t result_offset);
 	typedef void (*rollback_update_function_t)(UpdateInfo &base_info, UpdateInfo &rollback_info);
 	typedef idx_t (*statistics_update_function_t)(UpdateSegment *segment, SegmentStatistics &stats,
 	                                              UnifiedVectorFormat &update, idx_t count, SelectionVector &sel);

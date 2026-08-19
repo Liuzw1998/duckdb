@@ -1,4 +1,6 @@
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 
@@ -175,10 +177,95 @@ void ColumnSegment::ScanPartial(ColumnScanState &state, idx_t scan_count, Vector
 // Fetch
 //===--------------------------------------------------------------------===//
 void ColumnSegment::FetchRow(ColumnFetchState &state, row_t row_id, Vector &result, idx_t result_idx) {
-	if (UnsafeNumericCast<idx_t>(row_id) > count) {
+	const idx_t segment_count = count.load();
+	if (UnsafeNumericCast<idx_t>(row_id) >= segment_count) {
 		throw InternalException("ColumnSegment::FetchRow - row_id out of range for segment");
 	}
 	function.get().fetch_row(*this, state, row_id, result, result_idx);
+}
+
+void ColumnSegment::FetchRows(ColumnFetchState &state, const idx_t *offsets, idx_t fetch_count, Vector &result,
+                              idx_t result_offset) {
+	if (fetch_count == 0) {
+		return;
+	}
+	if (!offsets) {
+		throw InternalException("ColumnSegment::FetchRows - offsets cannot be null");
+	}
+	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
+		throw InternalException("ColumnSegment::FetchRows requires a flat result vector");
+	}
+	const idx_t result_capacity = FlatVector::GetCapacity(result);
+	if (result_offset > result_capacity || fetch_count > result_capacity - result_offset) {
+		throw InternalException("ColumnSegment::FetchRows - result offset out of range");
+	}
+	const idx_t segment_count = count.load();
+	bool strictly_increasing = true;
+	for (idx_t i = 0; i < fetch_count; i++) {
+		if (offsets[i] >= segment_count) {
+			throw InternalException("ColumnSegment::FetchRows - row_id out of range for segment");
+		}
+		strictly_increasing = strictly_increasing && (i == 0 || offsets[i - 1] < offsets[i]);
+	}
+	if (fetch_count > 1 && strictly_increasing && function.get().fetch_rows) {
+		function.get().fetch_rows(*this, state, offsets, fetch_count, result, result_offset);
+		return;
+	}
+	for (idx_t i = 0; i < fetch_count; i++) {
+		FetchRow(state, NumericCast<row_t>(offsets[i]), result, result_offset + i);
+	}
+}
+
+static void ScanFetchRun(ColumnSegment &segment, ColumnScanState &scan_state, idx_t scan_start, idx_t scan_count,
+                         Vector &result, idx_t result_offset) {
+	D_ASSERT(scan_count > 0);
+	D_ASSERT(scan_start >= scan_state.internal_index);
+	D_ASSERT(scan_state.offset_in_column == scan_state.internal_index);
+
+	scan_state.offset_in_column = scan_start;
+	segment.Skip(scan_state);
+	D_ASSERT(scan_state.internal_index == scan_start);
+	D_ASSERT(scan_state.offset_in_column == scan_state.internal_index);
+
+	segment.Scan(scan_state, scan_count, result, result_offset, ScanVectorType::SCAN_FLAT_VECTOR);
+	scan_state.offset_in_column += scan_count;
+	scan_state.internal_index = scan_state.offset_in_column;
+	D_ASSERT(scan_state.offset_in_column == scan_state.internal_index);
+}
+
+static void MaterializeScanStrings(Vector &result, idx_t result_offset, idx_t fetch_count) {
+	if (result.GetType().InternalType() != PhysicalType::VARCHAR) {
+		return;
+	}
+	// Data is fetched before its validity segment, so existing validity bits may be stale.
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
+	for (idx_t idx = 0; idx < fetch_count; idx++) {
+		const idx_t result_idx = result_offset + idx;
+		if (!result_data[result_idx].IsInlined()) {
+			result_data[result_idx] = StringVector::AddStringOrBlob(result, result_data[result_idx]);
+		}
+	}
+}
+
+void ColumnSegment::FetchRowsUsingScan(ColumnSegment &segment, ColumnFetchState &state, const idx_t *offsets,
+                                       idx_t fetch_count, Vector &result, idx_t result_offset) {
+	D_ASSERT(fetch_count > 1);
+	// Detached scan states use offsets relative to this segment.
+	ColumnScanState scan_state(nullptr);
+	scan_state.context = state.context;
+	segment.InitializeScan(scan_state);
+
+	idx_t fetch_idx = 0;
+	while (fetch_idx < fetch_count) {
+		const idx_t scan_start = offsets[fetch_idx];
+		idx_t run_count = 1;
+		while (fetch_idx + run_count < fetch_count && offsets[fetch_idx + run_count] - scan_start == run_count) {
+			run_count++;
+		}
+		ScanFetchRun(segment, scan_state, scan_start, run_count, result, result_offset + fetch_idx);
+		fetch_idx += run_count;
+	}
+	MaterializeScanStrings(result, result_offset, fetch_count);
 }
 
 //===--------------------------------------------------------------------===//

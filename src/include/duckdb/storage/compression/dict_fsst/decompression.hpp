@@ -23,6 +23,7 @@ public:
 public:
 	void Initialize(bool initialize_dictionary = true);
 	void ScanToFlatVector(Vector &result, idx_t result_offset, idx_t start, idx_t scan_count);
+	void FetchRows(Vector &result, idx_t result_offset, const idx_t *offsets, idx_t fetch_count);
 	void ScanToDictionaryVector(ColumnSegment &segment, Vector &result, idx_t result_offset, idx_t start,
 	                            idx_t scan_count);
 	const SelectionVector &GetSelVec(idx_t start, idx_t scan_count);

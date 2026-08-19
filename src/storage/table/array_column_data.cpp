@@ -244,16 +244,14 @@ unique_ptr<BaseStatistics> ArrayColumnData::GetUpdateStatistics() {
 }
 
 void ArrayColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state, const StorageIndex &storage_index,
-                                const idx_t *offsets, const SelectionVector &sel, idx_t fetch_count, Vector &result,
-                                idx_t result_offset) {
+                                const idx_t *offsets, idx_t fetch_count, Vector &result, idx_t result_offset) {
 	// Create state for validity & child column
 	if (state.child_states.empty()) {
 		state.child_states.push_back(make_uniq<ColumnFetchState>());
 	}
 
 	// Fetch validity
-	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, sel, fetch_count, result,
-	                                  result_offset);
+	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, fetch_count, result, result_offset);
 
 	// Fetch child column
 	auto &child_vec = ArrayVector::GetChildMutable(result);
@@ -265,7 +263,7 @@ void ArrayColumnData::FetchRows(TransactionData transaction, ColumnFetchState &s
 		ColumnScanState child_state(nullptr);
 		child_state.Initialize(state.context, child_type, nullptr);
 
-		const auto row_id = offsets[sel.get_index(idx)];
+		const auto row_id = offsets[idx];
 		const auto child_offset = row_id * array_size;
 
 		child_column->InitializeScanWithOffset(child_state, child_offset);

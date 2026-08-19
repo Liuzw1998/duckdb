@@ -14,18 +14,22 @@ CompressionFunction GetAlpFunction(PhysicalType data_type) {
 
 template <>
 CompressionFunction GetAlpFunction<float>(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<float>, AlpAnalyze<float>,
-	                           AlpFinalAnalyze<float>, AlpInitCompression<float>, AlpCompress<float>,
-	                           AlpFinalizeCompress<float>, AlpInitScan<float>, AlpScan<float>, AlpScanPartial<float>,
-	                           AlpFetchRow<float>, AlpSkip<float>);
+	auto alp = CompressionFunction(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<float>,
+	                               AlpAnalyze<float>, AlpFinalAnalyze<float>, AlpInitCompression<float>,
+	                               AlpCompress<float>, AlpFinalizeCompress<float>, AlpInitScan<float>, AlpScan<float>,
+	                               AlpScanPartial<float>, AlpFetchRow<float>, AlpSkip<float>);
+	alp.fetch_rows = AlpFetchRows<float>;
+	return alp;
 }
 
 template <>
 CompressionFunction GetAlpFunction<double>(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<double>, AlpAnalyze<double>,
-	                           AlpFinalAnalyze<double>, AlpInitCompression<double>, AlpCompress<double>,
-	                           AlpFinalizeCompress<double>, AlpInitScan<double>, AlpScan<double>,
-	                           AlpScanPartial<double>, AlpFetchRow<double>, AlpSkip<double>);
+	auto alp = CompressionFunction(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<double>,
+	                               AlpAnalyze<double>, AlpFinalAnalyze<double>, AlpInitCompression<double>,
+	                               AlpCompress<double>, AlpFinalizeCompress<double>, AlpInitScan<double>,
+	                               AlpScan<double>, AlpScanPartial<double>, AlpFetchRow<double>, AlpSkip<double>);
+	alp.fetch_rows = AlpFetchRows<double>;
+	return alp;
 }
 
 CompressionFunction AlpCompressionFun::GetFunction(PhysicalType type) {

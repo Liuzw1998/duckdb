@@ -63,6 +63,8 @@ struct DictFSSTCompressionStorage {
 	static void StringScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, Vector &result);
 	static void StringFetchRow(ColumnSegment &segment, ColumnFetchState &state, row_t row_id, Vector &result,
 	                           idx_t result_idx);
+	static void StringFetchRows(ColumnSegment &segment, ColumnFetchState &state, const idx_t *offsets,
+	                            idx_t fetch_count, Vector &result, idx_t result_offset);
 };
 
 //===--------------------------------------------------------------------===//
@@ -115,11 +117,6 @@ unique_ptr<SegmentScanState> DictFSSTCompressionStorage::StringInitScan(const Qu
 	auto &buffer_manager = BufferManager::GetBufferManager(segment.GetDatabase());
 	auto state = make_uniq<CompressedStringScanState>(segment, buffer_manager.Pin(segment.GetBlockHandle()));
 	state->Initialize(true);
-
-	const auto &stats = segment.GetStats();
-	if (stats.GetStatsType() == StatisticsType::STRING_STATS && StringStats::HasMaxStringLength(stats)) {
-		state->all_values_inlined = StringStats::MaxStringLength(stats) <= string_t::INLINE_LENGTH;
-	}
 	return std::move(state);
 }
 
@@ -154,6 +151,15 @@ void DictFSSTCompressionStorage::StringFetchRow(ColumnSegment &segment, ColumnFe
 	CompressedStringScanState scan_state(segment, state.GetOrInsertHandle(segment));
 	scan_state.Initialize(false);
 	scan_state.ScanToFlatVector(result, result_idx, NumericCast<idx_t>(row_id), 1);
+}
+
+void DictFSSTCompressionStorage::StringFetchRows(ColumnSegment &segment, ColumnFetchState &state, const idx_t *offsets,
+                                                 idx_t fetch_count, Vector &result, idx_t result_offset) {
+	D_ASSERT(fetch_count > 1);
+	CompressedStringScanState scan_state(segment, state.GetOrInsertHandle(segment));
+	// The existing FlatVector cannot inherit run-local dictionary ownership.
+	scan_state.Initialize(false);
+	scan_state.FetchRows(result, result_offset, offsets, fetch_count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -284,6 +290,7 @@ CompressionFunction DictFSSTCompressionFun::GetFunction(PhysicalType data_type) 
 	res.select = dict_fsst::DictFSSTSelect;
 	res.filter = dict_fsst::DictFSSTFilter;
 	res.get_segment_info = dict_fsst::DictFSSTGetSegmentInfo;
+	res.fetch_rows = dict_fsst::DictFSSTCompressionStorage::StringFetchRows;
 	return res;
 }
 

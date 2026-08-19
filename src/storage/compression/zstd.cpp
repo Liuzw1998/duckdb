@@ -735,20 +735,12 @@ public:
 		offset = AlignValue<idx_t, sizeof(compressed_size_t)>(offset);
 		compressed_sizes = reinterpret_cast<compressed_size_t *>(data + offset);
 		offset += (sizeof(compressed_size_t) * amount_of_vectors);
-
-		scanned_count = 0;
 	}
 	~ZSTDScanState() override {
 		duckdb_zstd::ZSTD_freeDCtx(decompression_context);
 	}
 
 public:
-	idx_t GetVectorIndex(idx_t start_index, idx_t &offset) {
-		idx_t vector_idx = start_index / ZSTD_VECTOR_SIZE;
-		offset = start_index % ZSTD_VECTOR_SIZE;
-		return vector_idx;
-	}
-
 	ZSTDVectorScanMetadata GetVectorMetadata(idx_t vector_idx) {
 		idx_t previous_value_count = vector_idx * ZSTD_VECTOR_SIZE;
 		idx_t value_count = MinValue<idx_t>(segment_count - previous_value_count, ZSTD_VECTOR_SIZE);
@@ -765,24 +757,14 @@ public:
 		return state.GetHandle(block_manager, block_id);
 	}
 
-	bool UseVectorStateCache(idx_t vector_idx, idx_t internal_offset) {
-		if (!current_vector) {
-			// No vector loaded yet
-			return false;
-		}
-		if (current_vector->metadata.vector_idx != vector_idx) {
-			// Not the same vector
-			return false;
-		}
-		if (current_vector->scanned_count != internal_offset) {
-			// Not the same scan offset
-			return false;
-		}
-		return true;
-	}
-
-	ZSTDVectorScanState &LoadVector(idx_t vector_idx, idx_t internal_offset) {
-		if (UseVectorStateCache(vector_idx, internal_offset)) {
+	ZSTDVectorScanState &AdvanceTo(idx_t target_offset) {
+		const idx_t vector_idx = target_offset / ZSTD_VECTOR_SIZE;
+		const idx_t internal_offset = target_offset % ZSTD_VECTOR_SIZE;
+		if (current_vector && current_vector->metadata.vector_idx == vector_idx &&
+		    current_vector->scanned_count <= internal_offset) {
+			if (current_vector->scanned_count < internal_offset) {
+				Skip(*current_vector, internal_offset - current_vector->scanned_count);
+			}
 			return *current_vector;
 		}
 		current_vector = make_uniq<ZSTDVectorScanState>();
@@ -923,7 +905,6 @@ public:
 			remaining -= to_scan;
 		}
 		scan_state.scanned_count += count;
-		scanned_count += count;
 	}
 
 	void ScanInternal(ZSTDVectorScanState &scan_state, idx_t count, Vector &result, idx_t result_offset) {
@@ -947,16 +928,13 @@ public:
 			offset += string_lengths[i];
 		}
 		scan_state.scanned_count += count;
-		scanned_count += count;
 	}
 
 	void ScanPartial(idx_t start_idx, Vector &result, idx_t offset, idx_t count) {
 		idx_t remaining = count;
 		idx_t scanned = 0;
 		while (remaining) {
-			idx_t internal_offset;
-			idx_t vector_idx = GetVectorIndex(start_idx + scanned, internal_offset);
-			auto &scan_state = LoadVector(vector_idx, internal_offset);
+			auto &scan_state = AdvanceTo(start_idx + scanned);
 			idx_t remaining_in_vector = scan_state.metadata.count - scan_state.scanned_count;
 			idx_t to_scan = MinValue<idx_t>(remaining, remaining_in_vector);
 			ScanInternal(scan_state, to_scan, result, offset + scanned);
@@ -989,8 +967,6 @@ public:
 
 	//! The amount of tuples stored in the segment
 	idx_t segment_count;
-	//! The amount of tuples consumed
-	idx_t scanned_count = 0;
 	ColumnSegment &segment;
 
 	//! Buffer for skipping data
@@ -1076,6 +1052,7 @@ CompressionFunction ZSTDFun::GetFunction(PhysicalType data_type) {
 	zstd.serialize_state = ZSTDStorage::SerializeState;
 	zstd.deserialize_state = ZSTDStorage::DeserializeState;
 	zstd.visit_block_ids = ZSTDStorage::VisitBlockIds;
+	zstd.fetch_rows = ColumnSegment::FetchRowsUsingScan;
 	return zstd;
 }
 

@@ -205,15 +205,14 @@ unique_ptr<BaseStatistics> StandardColumnData::GetUpdateStatistics() {
 }
 
 void StandardColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state,
-                                   const StorageIndex &storage_index, const idx_t *offsets, const SelectionVector &sel,
-                                   idx_t fetch_count, Vector &result, idx_t result_offset) {
+                                   const StorageIndex &storage_index, const idx_t *offsets, idx_t fetch_count,
+                                   Vector &result, idx_t result_offset) {
 	if (state.child_states.empty()) {
 		state.child_states.emplace_back(make_uniq<ColumnFetchState>());
 	}
 	// Bulk fetch the data and the validity in two passes.
-	FetchRowsAtSegmentLevel(transaction, state, offsets, sel, fetch_count, result, result_offset);
-	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, sel, fetch_count, result,
-	                                  result_offset);
+	FetchRowsAtSegmentLevel(transaction, state, offsets, fetch_count, result, result_offset);
+	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, fetch_count, result, result_offset);
 }
 
 void StandardColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {

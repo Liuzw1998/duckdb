@@ -75,8 +75,8 @@ idx_t RowNumberColumnData::Fetch(ColumnScanState &state, row_t row_id, Vector &r
 }
 
 void RowNumberColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state,
-                                    const StorageIndex &storage_index, const idx_t *offsets, const SelectionVector &sel,
-                                    idx_t fetch_count, Vector &result, idx_t result_offset) {
+                                    const StorageIndex &storage_index, const idx_t *offsets, idx_t fetch_count,
+                                    Vector &result, idx_t result_offset) {
 	throw InternalException("FetchRows is not supported for row number columns");
 }
 

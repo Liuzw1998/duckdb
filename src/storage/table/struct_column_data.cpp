@@ -337,10 +337,10 @@ unique_ptr<BaseStatistics> StructColumnData::GetUpdateStatistics() {
 }
 
 void StructColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state,
-                                 const StorageIndex &storage_index, const idx_t *offsets, const SelectionVector &sel,
-                                 idx_t fetch_count, Vector &result, idx_t result_offset) {
+                                 const StorageIndex &storage_index, const idx_t *offsets, idx_t fetch_count,
+                                 Vector &result, idx_t result_offset) {
 	// fetch the validity state
-	validity->FetchRowsAtSegmentLevel(transaction, state, offsets, sel, fetch_count, result, result_offset);
+	validity->FetchRowsAtSegmentLevel(transaction, state, offsets, fetch_count, result, result_offset);
 	if (storage_index.IsPushdownExtract()) {
 		auto &index_children = storage_index.GetChildIndexes();
 		D_ASSERT(index_children.size() == 1);
@@ -352,17 +352,15 @@ void StructColumnData::FetchRows(TransactionData transaction, ColumnFetchState &
 		    child_storage_index.GetType() != child_type) {
 			auto context = transaction.transaction->context.lock();
 			for (idx_t idx = 0; idx < fetch_count; idx++) {
-				const idx_t offset = offsets[sel.get_index(idx)];
+				const idx_t offset = offsets[idx];
 				Vector intermediate(child_type, 1);
-				sub_column.FetchRows(transaction, state, child_storage_index, &offset,
-				                     *FlatVector::IncrementalSelectionVector(), /*count=*/1, intermediate, 0);
+				sub_column.FetchRows(transaction, state, child_storage_index, &offset, /*count=*/1, intermediate, 0);
 				auto fetched_row = intermediate.GetValue(0).CastAs(*context, result.GetType());
 				result.SetValue(result_offset + idx, fetched_row);
 			}
 			return;
 		} else {
-			sub_column.FetchRows(transaction, state, child_storage_index, offsets, sel, fetch_count, result,
-			                     result_offset);
+			sub_column.FetchRows(transaction, state, child_storage_index, offsets, fetch_count, result, result_offset);
 			return;
 		}
 	}
@@ -370,7 +368,7 @@ void StructColumnData::FetchRows(TransactionData transaction, ColumnFetchState &
 	auto &child_entries = StructVector::GetEntries(result);
 	// fetch the sub-column states
 	for (idx_t i = 0; i < child_entries.size(); i++) {
-		sub_columns[i]->FetchRows(transaction, state, storage_index, offsets, sel, fetch_count, child_entries[i],
+		sub_columns[i]->FetchRows(transaction, state, storage_index, offsets, fetch_count, child_entries[i],
 		                          result_offset);
 	}
 }

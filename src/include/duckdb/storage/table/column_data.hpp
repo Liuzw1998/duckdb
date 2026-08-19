@@ -177,11 +177,11 @@ public:
 	virtual idx_t Fetch(ColumnScanState &state, row_t row_id, Vector &result);
 	//! Fetch a batch of row offsets and append them to the vector
 	virtual void FetchRows(TransactionData transaction, ColumnFetchState &state, const StorageIndex &storage_index,
-	                       const idx_t *offsets, const SelectionVector &sel, idx_t count, Vector &result,
-	                       idx_t result_offset);
+	                       const idx_t *offsets, idx_t count, Vector &result, idx_t result_offset);
 	//! Fetches a batch of row offsets for leaf columns.
+	//! Current row fetch execution batches are capped at STANDARD_VECTOR_SIZE before reaching the codec API.
 	void FetchRowsAtSegmentLevel(TransactionData transaction, ColumnFetchState &state, const idx_t *offsets,
-	                             const SelectionVector &sel, idx_t count, Vector &result, idx_t result_offset);
+	                             idx_t count, Vector &result, idx_t result_offset);
 
 	virtual void Update(TransactionData transaction, DuckTableEntry &table_entry, idx_t column_index,
 	                    Vector &update_vector, row_t *row_ids, idx_t update_count, idx_t row_group_start);

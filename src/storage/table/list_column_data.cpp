@@ -281,21 +281,19 @@ unique_ptr<BaseStatistics> ListColumnData::GetUpdateStatistics() {
 	return nullptr;
 }
 void ListColumnData::FetchRows(TransactionData transaction, ColumnFetchState &state, const StorageIndex &storage_index,
-                               const idx_t *offsets, const SelectionVector &sel, idx_t fetch_count, Vector &result,
-                               idx_t result_offset) {
+                               const idx_t *offsets, idx_t fetch_count, Vector &result, idx_t result_offset) {
 	// insert the validity child state
 	if (state.child_states.empty()) {
 		auto child_state = make_uniq<ColumnFetchState>();
 		state.child_states.push_back(std::move(child_state));
 	}
 
-	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, sel, fetch_count, result,
-	                                  result_offset);
+	validity->FetchRowsAtSegmentLevel(transaction, *state.child_states[0], offsets, fetch_count, result, result_offset);
 
 	auto &validity_mask = FlatVector::ValidityMutable(result);
 	auto list_data = FlatVector::GetDataMutable<list_entry_t>(result);
 	for (idx_t idx = 0; idx < fetch_count; idx++) {
-		const auto row_id = offsets[sel.get_index(idx)];
+		const auto row_id = offsets[idx];
 		auto start_offset = row_id == 0 ? 0 : FetchListOffset(row_id - 1);
 		auto end_offset = FetchListOffset(row_id);
 		auto result_idx = result_offset + idx;
