@@ -1076,6 +1076,7 @@ CompressionFunction ZSTDFun::GetFunction(PhysicalType data_type) {
 	zstd.serialize_state = ZSTDStorage::SerializeState;
 	zstd.deserialize_state = ZSTDStorage::DeserializeState;
 	zstd.visit_block_ids = ZSTDStorage::VisitBlockIds;
+	zstd.position_scan_threshold = 3;
 	return zstd;
 }
 

@@ -48,6 +48,16 @@ public:
 	unique_ptr<StorageLockKey> GetSharedLock() {
 		return checkpoint_lock.GetSharedLock();
 	}
+	//! Prevent append rollback from mutating a RowGroup tree pinned by a position scan.
+	unique_ptr<StorageLockKey> GetSharedPositionScanLock() {
+		return position_scan_lock.GetSharedLock();
+	}
+	unique_ptr<StorageLockKey> GetExclusivePositionScanLock() {
+		return position_scan_lock.GetExclusiveLock();
+	}
+	unique_ptr<StorageLockKey> TryGetExclusivePositionScanLock() {
+		return position_scan_lock.TryGetExclusiveLock();
+	}
 	bool AppendRequiresNewRowGroup(RowGroupCollection &collection, transaction_t checkpoint_id);
 	optional_idx CheckpointRowGroupCount(const CheckpointOptions &options) const;
 	void VerifyIndexBuffers();
@@ -75,6 +85,8 @@ private:
 	vector<IndexStorageInfo> index_storage_infos;
 	//! Lock held while checkpointing
 	StorageLock checkpoint_lock;
+	//! Lock held while a position scan reads RowGroups that append rollback may truncate in place.
+	StorageLock position_scan_lock;
 	//! The last seen checkpoint while doing a concurrent operation, if any
 	optional_idx last_seen_checkpoint;
 	//! The amount of row groups the checkpoint is processing

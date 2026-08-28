@@ -284,6 +284,7 @@ CompressionFunction DictFSSTCompressionFun::GetFunction(PhysicalType data_type) 
 	res.select = dict_fsst::DictFSSTSelect;
 	res.filter = dict_fsst::DictFSSTFilter;
 	res.get_segment_info = dict_fsst::DictFSSTGetSegmentInfo;
+	res.position_scan_threshold = 5;
 	return res;
 }
 

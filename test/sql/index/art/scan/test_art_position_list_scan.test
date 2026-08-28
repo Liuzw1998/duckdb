@@ -1,0 +1,461 @@
+# name: test/sql/index/art/scan/test_art_position_list_scan.test
+# description: Test ART position-list scan geometry, materialization, and transaction semantics
+# group: [scan]
+
+load {TEST_DIR}/art_position_list_scan.db
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET threads = 4;
+
+# Position geometry and count-only scans
+statement ok
+CREATE TABLE position_geometry(id BIGINT, payload BIGINT);
+
+statement ok
+INSERT INTO position_geometry SELECT i, i * 10 FROM range(130000) r(i);
+
+statement ok
+CREATE INDEX position_geometry_id ON position_geometry USING ART(id);
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM position_geometry WHERE id BETWEEN 0 AND 2048;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT id FROM position_geometry WHERE id = -1;
+----
+
+# Empty persistent ART results still scan matching transaction-local rows.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO position_geometry VALUES (-1, -10);
+
+query II
+EXPLAIN ANALYZE SELECT id, payload FROM position_geometry WHERE id = -1;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+SELECT id, payload FROM position_geometry WHERE id = -1;
+----
+-1	-10
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM position_geometry WHERE id = 0;
+----
+1
+
+query I
+SELECT count(*) FROM position_geometry WHERE id BETWEEN 0 AND 1;
+----
+2
+
+query III
+SELECT count(*), min(payload), max(payload) FROM position_geometry WHERE id BETWEEN 0 AND 2046;
+----
+2047	0	20460
+
+query III
+SELECT count(*), min(payload), max(payload) FROM position_geometry WHERE id BETWEEN 0 AND 2047;
+----
+2048	0	20470
+
+query III
+SELECT count(*), min(payload), max(payload) FROM position_geometry WHERE id BETWEEN 0 AND 2048;
+----
+2049	0	20480
+
+query III
+SELECT count(*), min(payload), max(payload) FROM position_geometry WHERE id BETWEEN 122878 AND 122882;
+----
+5	1228780	1228820
+
+query III
+SELECT count(*), min(payload), max(payload) FROM position_geometry WHERE id BETWEEN 129998 AND 129999;
+----
+2	1299980	1299990
+
+query I
+SELECT id FROM position_geometry WHERE id IN (1, 2049, 122881, 129999) ORDER BY id;
+----
+1
+2049
+122881
+129999
+
+query III
+SELECT count(*), bool_and(id = rowid), sum(payload)
+FROM position_geometry WHERE id BETWEEN 0 AND 31;
+----
+32	true	4960
+
+# One DICT_FSST batch containing a vectorized window followed by sparse windows
+statement ok
+CREATE TABLE position_dict_sparse(id BIGINT, payload VARCHAR USING COMPRESSION DICT_FSST);
+
+statement ok
+INSERT INTO position_dict_sparse
+SELECT CASE WHEN i < 17 THEN i
+            WHEN i % 2048 = 0 THEN 16 + i / 2048
+            ELSE 1000000 + i END,
+       'value-' || (i % 8)
+FROM range(131072) r(i);
+
+statement ok
+CHECKPOINT;
+
+statement ok
+CREATE INDEX position_dict_sparse_id ON position_dict_sparse USING ART(id);
+
+statement ok
+SET threads = 1;
+
+query ITT
+SELECT count(*), min(payload), max(payload) FROM position_dict_sparse WHERE id < 32;
+----
+32	value-0	value-7
+
+statement ok
+SET threads = 4;
+
+# More than 32 physical windows are split into multiple output batches.
+query ITT
+SELECT count(*), min(payload), max(payload) FROM position_dict_sparse WHERE id < 80;
+----
+80	value-0	value-7
+
+statement ok
+SET debug_force_fetch_row = true;
+
+query ITT
+SELECT count(*), min(payload), max(payload) FROM position_dict_sparse WHERE id < 32;
+----
+32	value-0	value-7
+
+# Forced Fetch still applies the index predicate to transaction-local rows.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO position_dict_sparse VALUES
+    (-1, 'local-match'),
+    (2000000, 'local-other');
+
+query II
+SELECT count(*), count(*) FILTER (WHERE payload = 'local-match')
+FROM position_dict_sparse WHERE id < 32;
+----
+33	1
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET debug_force_fetch_row = false;
+
+# The first position window is empty after MVCC selection.
+statement ok
+DELETE FROM position_dict_sparse WHERE id < 17;
+
+query ITT
+SELECT count(*), min(payload), max(payload) FROM position_dict_sparse WHERE id < 32;
+----
+15	value-0	value-0
+
+# Multiple selected windows in one output batch cross a DICT_FSST ColumnSegment boundary.
+statement ok
+ATTACH '{TEST_DIR}/art_position_dict_segments.db' AS position_segments
+    (BLOCK_SIZE 16384, ROW_GROUP_SIZE 32768);
+
+statement ok
+CREATE TABLE position_segments.position_dict_segments(
+    id BIGINT,
+    payload VARCHAR USING COMPRESSION DICT_FSST
+);
+
+statement ok
+INSERT INTO position_segments.position_dict_segments
+SELECT CASE WHEN i % 32 = 0 THEN i / 32 ELSE 1000000 + i END,
+       'value-' || (i % 8)
+FROM range(32768) r(i);
+
+statement ok
+CHECKPOINT position_segments;
+
+statement ok
+CREATE INDEX position_dict_segments_id
+ON position_segments.position_dict_segments USING ART(id);
+
+query II
+SELECT count(*) > 1, count(*) FILTER (WHERE start % 2048 != 0) > 0
+FROM pragma_storage_info('position_segments.position_dict_segments')
+WHERE column_name = 'payload' AND compression = 'DICT_FSST' AND segment_type = 'VARCHAR';
+----
+true	true
+
+query ITT
+SELECT count(*), min(payload), max(payload)
+FROM position_segments.position_dict_segments WHERE id < 1024;
+----
+1024	value-0	value-0
+
+# Position windows use RowGroup-relative offsets across a non-aligned boundary.
+statement ok
+CREATE TABLE position_segments.position_unaligned_row_groups(
+    id BIGINT,
+    bucket INTEGER,
+    payload BIGINT USING COMPRESSION UNCOMPRESSED
+);
+
+statement ok
+INSERT INTO position_segments.position_unaligned_row_groups
+SELECT i, CASE WHEN i >= 18433 THEN 7 ELSE 8 END, i
+FROM range(18449) r(i);
+
+statement ok
+CHECKPOINT position_segments;
+
+statement ok
+CREATE INDEX position_unaligned_row_groups_bucket
+ON position_segments.position_unaligned_row_groups USING ART(bucket);
+
+statement ok
+INSERT INTO position_segments.position_unaligned_row_groups
+SELECT i, CASE WHEN i < 18465 THEN 7 ELSE 8 END, i
+FROM range(18449, 20497) r(i);
+
+statement ok
+CHECKPOINT position_segments;
+
+query III
+WITH row_groups AS (
+    SELECT row_group_id, sum(count)::BIGINT AS row_count
+    FROM pragma_storage_info('position_segments.position_unaligned_row_groups')
+    WHERE column_name = 'id' AND segment_type = 'BIGINT'
+    GROUP BY row_group_id
+), row_group_starts AS (
+    SELECT row_group_id,
+           coalesce(sum(row_count) OVER (
+               ORDER BY row_group_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+           ), 0)::BIGINT AS row_group_start
+    FROM row_groups
+)
+SELECT row_group_id, row_group_start, row_group_start % 2048
+FROM row_group_starts WHERE row_group_id = 1;
+----
+1	18449	17
+
+query III
+SELECT count(*), bool_and(id = rowid AND payload = id), sum(payload)
+FROM position_segments.position_unaligned_row_groups WHERE bucket = 7;
+----
+32	true	590352
+
+# Position scans across RowGroups must not bypass filters on local rows.
+statement ok
+CREATE TABLE position_segments.position_row_group_boundary(payload BIGINT, bucket INTEGER);
+
+statement ok
+INSERT INTO position_segments.position_row_group_boundary
+SELECT i, 7 FROM range(65536) r(i);
+
+statement ok
+CHECKPOINT position_segments;
+
+statement ok
+CREATE INDEX position_row_group_boundary_bucket
+ON position_segments.position_row_group_boundary USING ART(bucket);
+
+statement ok
+SET threads = 4;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO position_segments.position_row_group_boundary
+SELECT 65536 + i, CASE WHEN i % 2 = 0 THEN 7 ELSE 8 END
+FROM range(5000) r(i);
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*), sum(payload)
+FROM position_segments.position_row_group_boundary WHERE bucket = 7;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query IIIII
+SELECT count(*), count(DISTINCT payload), min(payload), max(payload), sum(payload)
+FROM position_segments.position_row_group_boundary WHERE bucket = 7;
+----
+68036	68036	0	70534	2317538380
+
+statement ok
+ROLLBACK;
+
+# Mixed codec projections and transaction semantics
+statement ok
+CREATE TABLE position_payloads(
+    id BIGINT,
+    bucket INTEGER,
+    u BIGINT USING COMPRESSION UNCOMPRESSED,
+    a DOUBLE USING COMPRESSION ALP,
+    d VARCHAR USING COMPRESSION DICT_FSST,
+    z VARCHAR USING COMPRESSION ZSTD,
+    nullable BIGINT,
+    arr BIGINT[2],
+    lst BIGINT[] USING COMPRESSION RLE,
+    s STRUCT(x BIGINT, y VARCHAR)
+);
+
+statement ok
+INSERT INTO position_payloads
+SELECT i,
+       i % 128,
+       i * 3,
+       i::DOUBLE / 10,
+       'dict-' || (i % 23),
+       repeat('z', 80) || (i % 31),
+       CASE WHEN i % 512 = 7 THEN NULL ELSE i END,
+       [i, i + 1]::BIGINT[2],
+       [i, i + 1, i + 2],
+       struct_pack(x := i * 2, y := 's-' || i)
+FROM range(10000) r(i);
+
+statement ok
+CHECKPOINT;
+
+statement ok
+CREATE INDEX position_payloads_bucket ON position_payloads USING ART(bucket);
+
+query IIIII
+SELECT count(*) FILTER (
+           WHERE column_name = 'u' AND compression = 'Uncompressed' AND segment_type = 'BIGINT'
+       ) > 0,
+       count(*) FILTER (
+           WHERE column_name = 'a' AND compression = 'ALP' AND segment_type = 'DOUBLE'
+       ) > 0,
+       count(*) FILTER (
+           WHERE column_name = 'd' AND compression = 'DICT_FSST' AND segment_type = 'VARCHAR'
+       ) > 0,
+       count(*) FILTER (
+           WHERE column_name = 'z' AND compression = 'ZSTD' AND segment_type = 'VARCHAR'
+       ) > 0,
+       count(*) FILTER (
+           WHERE column_name = 'lst' AND compression = 'RLE' AND segment_type = 'BIGINT[]'
+       ) > 0
+FROM pragma_storage_info('position_payloads');
+----
+true	true	true	true	true
+
+query I
+SELECT count(*) FROM position_payloads WHERE bucket = 999;
+----
+0
+
+query II
+SELECT sum(u), CAST(round(sum(a) * 10) AS BIGINT) FROM position_payloads WHERE bucket = 7;
+----
+1184763	394921
+
+query II
+SELECT count(nullable), sum(nullable) FROM position_payloads WHERE bucket = 7;
+----
+59	297501
+
+query III
+SELECT sum(arr[1]), sum(lst[1]), sum(s.x) FROM position_payloads WHERE bucket = 7;
+----
+394921	394921	789842
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*), sum(u)
+FROM (SELECT u, d FROM position_payloads WHERE bucket = 7 OFFSET 0) q
+WHERE d = 'dict-7';
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+SELECT count(*), sum(u)
+FROM (SELECT u, d FROM position_payloads WHERE bucket = 7 OFFSET 0) q
+WHERE d = 'dict-7';
+----
+4	53076
+
+statement ok
+UPDATE position_payloads SET u = u + 100000 WHERE id = 7;
+
+statement ok
+DELETE FROM position_payloads WHERE id = 135;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO position_payloads VALUES (
+    10119, 7, 30357, 1011.9, 'dict-local', 'z-local', NULL,
+    [10119, 10120]::BIGINT[2], [10119, 10120, 10121], struct_pack(x := 20238, y := 's-local')
+), (
+    10120, 8, -999, 1012.0, 'dict-other', 'z-other', NULL,
+    [10120, 10121]::BIGINT[2], [10120, 10121, 10122], struct_pack(x := 20240, y := 's-other')
+);
+
+query I
+SELECT count(*) FROM position_payloads WHERE bucket = 7;
+----
+79
+
+query II
+SELECT sum(u), CAST(round(sum(a) * 10) AS BIGINT) FROM position_payloads WHERE bucket = 7;
+----
+1314715	404905
+
+query TT
+SELECT min(d), min(z) FROM position_payloads WHERE bucket = 7;
+----
+dict-0	z-local
+
+query II
+SELECT count(nullable), sum(nullable) FROM position_payloads WHERE bucket = 7;
+----
+58	297366
+
+query III
+SELECT sum(arr[1]), sum(lst[1]), sum(s.x) FROM position_payloads WHERE bucket = 7;
+----
+404905	404905	809810
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE position_payloads SET u = -1 WHERE id = 263;
+
+query I
+SELECT min(u) FROM position_payloads WHERE bucket = 7;
+----
+-1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT min(u) FROM position_payloads WHERE bucket = 7;
+----
+789

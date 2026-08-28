@@ -3,18 +3,25 @@
 # group: [interquery]
 
 statement ok
-CREATE TABLE integers(i INTEGER PRIMARY KEY)
+CREATE TABLE integers(i INTEGER PRIMARY KEY, payload BIGINT USING COMPRESSION UNCOMPRESSED)
 
 statement ok
-INSERT INTO integers SELECT * FROM range(10000);
+INSERT INTO integers SELECT i, i * 3 FROM range(10000) r(i);
 
 concurrentloop threadid 0 20
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+statement ok
+SET index_scan_max_count = 0;
 
 loop i 0 20
 
 onlyif threadid=0
 statement ok
-INSERT INTO integers SELECT * FROM range(10000 + {i} * 100, 10100 + {i} * 100);
+INSERT INTO integers
+SELECT i, i * 3 FROM range(10000 + {i} * 100, 10100 + {i} * 100) r(i);
 
 endloop
 
@@ -23,6 +30,17 @@ loop i 0 100
 skipif threadid=0
 statement ok
 SELECT * FROM integers WHERE i={i} * ({threadid} * 300);
+
+endloop
+
+loop i 0 20
+
+# 9983 creates 17 hits in the initial tail vector while concurrent appends extend that vector.
+skipif threadid=0
+query I
+SELECT bool_and(payload = i * 3) FROM integers WHERE i >= 9983 AND i < 12000;
+----
+true
 
 endloop
 

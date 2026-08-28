@@ -35,12 +35,171 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
 
 namespace duckdb {
+
+//! One touched physical vector in a position-list scan.
+struct PositionScanWindow {
+	idx_t window_start;
+	idx_t position_begin;
+	idx_t candidate_count;
+};
+
+//! Adjacent windows that together produce at most one output vector.
+struct PositionScanBatch {
+	idx_t window_begin;
+	idx_t window_count;
+	idx_t candidate_count;
+};
+
+struct PositionScanData {
+	//! Own the lock used to protect a planned RowGroup tree while a batch is being scanned.
+	shared_ptr<DataTableInfo> table_info;
+	//! Pin the RowGroup tree because checkpoint can replace it after physical windows are planned.
+	shared_ptr<RowGroupSegmentTree> row_groups;
+	//! Track the live row-ID boundary because append rollback can shorten the pinned tree between batches.
+	shared_ptr<RowGroupCollection> row_group_collection;
+	//! Absolute, ascending, unique persistent ART row IDs and their physical-window plan.
+	vector<row_t> positions;
+	vector<PositionScanWindow> windows;
+	vector<PositionScanBatch> batches;
+	atomic<idx_t> completed_rows {0};
+};
+
+struct PositionScanLocalState {
+	idx_t next_window_index = DConstants::INVALID_INDEX;
+	//! Protect the pinned RowGroup tree while the active batch is being scanned.
+	unique_ptr<StorageLockKey> position_scan_lock;
+	//! Persistent scratch data for batches containing multiple windows.
+	DataChunk window_chunk;
+	//! The persistent scan state is pinned to the RowGroup tree used for planning.
+	TableScanState scan_state;
+};
+
+//! Bound per-batch scheduling work when row IDs span many sparse vectors.
+static constexpr idx_t MAX_POSITION_SCAN_WINDOWS_PER_BATCH = 32;
+
+static void BuildPositionScanPlan(RowGroupSegmentTree &row_groups, vector<row_t> &positions,
+                                  vector<PositionScanWindow> &windows, vector<PositionScanBatch> &batches) {
+	optional_ptr<SegmentNode<RowGroup>> row_group;
+	idx_t cached_window_start = 0;
+	idx_t cached_window_end = 0;
+	idx_t input_idx = 0;
+	idx_t output_idx = 0;
+	while (input_idx < positions.size()) {
+		D_ASSERT(input_idx == 0 || positions[input_idx - 1] < positions[input_idx]);
+		const auto row_index = NumericCast<idx_t>(positions[input_idx]);
+		if (row_index < cached_window_start || row_index >= cached_window_end) {
+			if (!row_group || row_index < row_group->GetRowStart() || row_index >= row_group->GetRowEnd()) {
+				auto tree_lock = row_groups.Lock();
+				idx_t segment_idx;
+				// Match Index Fetch by skipping row IDs absent from this captured tree during concurrent append.
+				if (!row_groups.TryGetSegmentIndex(tree_lock, row_index, segment_idx)) {
+					input_idx++;
+					continue;
+				}
+				row_group = row_groups.GetSegmentByIndex(tree_lock, UnsafeNumericCast<int64_t>(segment_idx));
+			}
+
+			const auto row_group_offset = row_index - row_group->GetRowStart();
+			const auto physical_start = row_group_offset / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
+			cached_window_start = row_group->GetRowStart() + physical_start;
+			const auto physical_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, row_group->GetCount() - physical_start);
+			cached_window_end = cached_window_start + physical_count;
+		}
+		if (windows.empty() || windows.back().window_start != cached_window_start) {
+			windows.push_back({cached_window_start, output_idx, 0});
+		}
+		positions[output_idx++] = positions[input_idx++];
+		windows.back().candidate_count++;
+	}
+	positions.resize(output_idx);
+
+	for (idx_t window_idx = 0; window_idx < windows.size(); window_idx++) {
+		auto &window = windows[window_idx];
+		if (batches.empty() || batches.back().candidate_count + window.candidate_count > STANDARD_VECTOR_SIZE ||
+		    batches.back().window_count >= MAX_POSITION_SCAN_WINDOWS_PER_BATCH) {
+			batches.push_back({window_idx, 0, 0});
+		}
+		auto &batch = batches.back();
+		batch.window_count++;
+		batch.candidate_count += window.candidate_count;
+	}
+}
+
+static void PreparePositionScanWindow(DuckTransaction &transaction, CollectionScanState &scan_state,
+                                      const vector<row_t> &positions, const PositionScanWindow &window, idx_t max_row) {
+	auto &prepared = scan_state.prepared_vector;
+	D_ASSERT(prepared.prepare_state == VectorPrepareState::NONE);
+	if (window.window_start >= max_row) {
+		prepared.prepare_state = VectorPrepareState::IO_REGISTERED;
+		prepared.max_count = 0;
+		prepared.visible_count = 0;
+		return;
+	}
+	auto row_group = scan_state.row_group;
+	if (!row_group || window.window_start < row_group->GetRowStart() || window.window_start >= row_group->GetRowEnd()) {
+		auto tree_lock = scan_state.row_groups->Lock();
+		idx_t segment_idx;
+		if (!scan_state.row_groups->TryGetSegmentIndex(tree_lock, window.window_start, segment_idx)) {
+			prepared.prepare_state = VectorPrepareState::IO_REGISTERED;
+			prepared.max_count = 0;
+			prepared.visible_count = 0;
+			return;
+		}
+		row_group = scan_state.row_groups->GetSegmentByIndex(tree_lock, UnsafeNumericCast<int64_t>(segment_idx));
+	}
+	const auto physical_start = window.window_start - row_group->GetRowStart();
+	D_ASSERT(physical_start < row_group->GetCount());
+	const auto physical_count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, row_group->GetCount() - physical_start);
+	auto &position_sel = scan_state.valid_sel;
+
+	idx_t offsets[STANDARD_VECTOR_SIZE];
+	idx_t candidate_count = 0;
+	for (; candidate_count < window.candidate_count; candidate_count++) {
+		const auto row_id = NumericCast<idx_t>(positions[window.position_begin + candidate_count]);
+		if (row_id >= max_row) {
+			break;
+		}
+		const auto position = row_id - window.window_start;
+		if (position >= physical_count) {
+			break;
+		}
+		position_sel.set_index(candidate_count, position);
+		offsets[candidate_count] = physical_start + position;
+	}
+	if (candidate_count == 0) {
+		prepared.prepare_state = VectorPrepareState::IO_REGISTERED;
+		prepared.max_count = physical_count;
+		prepared.visible_count = 0;
+		return;
+	}
+
+	sel_t visible_buffer[STANDARD_VECTOR_SIZE];
+	SelectionVector visible_sel(visible_buffer, STANDARD_VECTOR_SIZE);
+	auto &current_row_group = row_group->GetNode();
+	const auto visible_count =
+	    current_row_group.Fetch(TransactionData(transaction), offsets, candidate_count, visible_sel);
+	if (visible_count != candidate_count) {
+		for (idx_t i = 0; i < visible_count; i++) {
+			position_sel.set_index(i, position_sel.get_index(visible_sel.get_index(i)));
+		}
+	}
+	if (visible_count == 0) {
+		prepared.prepare_state = VectorPrepareState::IO_REGISTERED;
+		prepared.max_count = physical_count;
+		prepared.visible_count = 0;
+		return;
+	}
+	current_row_group.PreparePositionScan(scan_state, *row_group, physical_start / STANDARD_VECTOR_SIZE, physical_count,
+	                                      visible_count);
+}
 
 struct TableScanLocalState : public LocalTableFunctionState {
 	//! The current position in the scan.
@@ -63,10 +222,9 @@ struct IndexScanLocalState : public LocalTableFunctionState {
 	ColumnFetchState fetch_state;
 	//! The current position in the local storage scan.
 	TableScanState scan_state;
-	//! The column IDs of the local storage scan.
-	vector<StorageIndex> column_ids;
 	bool in_charge_of_final_stretch {false};
 	idx_t rows_scanned = 0;
+	unique_ptr<PositionScanLocalState> position_state;
 };
 
 class TableScanGlobalState : public GlobalTableFunctionState {
@@ -114,8 +272,7 @@ public:
 	      row_ids(nullptr), row_id_count(0), finished_first_phase(false), started_last_phase(false) {
 	}
 
-	//! The batch index of the next Sink.
-	//! Also determines the offset of the next chunk. I.e., offset = next_batch_index * STANDARD_VECTOR_SIZE.
+	//! The index of the next persistent batch.
 	atomic<idx_t> next_batch_index;
 	//! The arena allocator containing the memory of the row IDs.
 	ArenaAllocator arena;
@@ -132,12 +289,14 @@ public:
 	mutex index_scan_lock;
 	//! Keep ART rowids and row-group trees paired while rowid-shifting index vacuum can run.
 	unique_ptr<StorageLockKey> vacuum_lock;
+	//! Non-null when persistent ART row IDs use position-list materialization.
+	unique_ptr<PositionScanData> position_data;
 
 public:
 	unique_ptr<LocalTableFunctionState> InitLocalState(ExecutionContext &context,
 	                                                   TableFunctionInitInput &input) override {
 		auto l_state = make_uniq<IndexScanLocalState>();
-		if (input.CanRemoveFilterColumns()) {
+		if (position_data || input.CanRemoveFilterColumns()) {
 			l_state->all_columns.Initialize(context.client, scanned_types);
 		}
 		l_state->scan_state.options.force_fetch_row = Settings::Get<DebugForceFetchRowSetting>(context.client);
@@ -148,20 +307,44 @@ public:
 		auto &storage = duck_table.GetStorage();
 		auto &local_storage = LocalStorage::Get(context.client, duck_table.catalog);
 
-		for (const auto &col_idx : input.column_indexes) {
-			l_state->column_ids.push_back(bind_data.table.GetStorageIndex(col_idx));
-		}
-		l_state->scan_state.Initialize(l_state->column_ids, context.client, input.filters.get());
+		l_state->scan_state.Initialize(column_ids, context.client, input.filters.get());
 		local_storage.InitializeScan(storage, l_state->scan_state.local_state, input.filters);
+
+		if (position_data) {
+			l_state->position_state = make_uniq<PositionScanLocalState>();
+			auto &position = *l_state->position_state;
+			position.scan_state.Initialize(column_ids, context.client);
+			auto &table_state = position.scan_state.table_state;
+			table_state.row_groups = position_data->row_groups;
+			table_state.Initialize(context.client, storage.GetRowGroupCollection()->GetTypes());
+		}
 		return std::move(l_state);
 	}
 
+	void ScanLocalStorage(DuckTransaction &transaction, IndexScanLocalState &l_state, DataChunk &output) {
+		auto &local_storage = LocalStorage::Get(transaction);
+		if (CanRemoveFilterColumns()) {
+			l_state.all_columns.Reset();
+			local_storage.Scan(l_state.scan_state.local_state, column_ids, l_state.all_columns);
+			output.ReferenceColumns(l_state.all_columns, projection_ids);
+		} else {
+			local_storage.Scan(l_state.scan_state.local_state, column_ids, output);
+		}
+		l_state.rows_scanned += output.size();
+	}
+
 	void TableScanFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) override {
+		auto &l_state = data_p.local_state->Cast<IndexScanLocalState>();
+		D_ASSERT(bool(position_data) == bool(l_state.position_state));
+		if (position_data) {
+			PositionScanFunc(context, data_p, l_state, output);
+			return;
+		}
+
 		auto &bind_data = data_p.bind_data->Cast<TableScanBindData>();
 		auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
 		auto &tx = DuckTransaction::Get(context, duck_table.catalog);
 		auto &storage = duck_table.GetStorage();
-		auto &l_state = data_p.local_state->Cast<IndexScanLocalState>();
 
 		enum class ExecutionPhase { NONE = 0, STORAGE = 1, LOCAL_STORAGE = 2 };
 
@@ -229,24 +412,116 @@ public:
 			}
 			case ExecutionPhase::LOCAL_STORAGE: {
 				// Scan (sequentially, always same logical thread) local_storage
-				auto &local_storage = LocalStorage::Get(tx);
-				{
-					if (CanRemoveFilterColumns()) {
-						l_state.all_columns.Reset();
-						local_storage.Scan(l_state.scan_state.local_state, column_ids, l_state.all_columns);
-						output.ReferenceColumns(l_state.all_columns, projection_ids);
-					} else {
-						local_storage.Scan(l_state.scan_state.local_state, column_ids, output);
-					}
-					l_state.rows_scanned += output.size();
-				}
+				ScanLocalStorage(tx, l_state, output);
 				return;
 			}
 			}
 		}
 	}
 
+	void ProcessPositionWindow(DuckTransaction &transaction, IndexScanLocalState &l_state, bool use_window_chunk) {
+		auto &position = *l_state.position_state;
+		D_ASSERT(position.position_scan_lock);
+		const auto &window = position_data->windows[position.next_window_index];
+		auto &scan_chunk = use_window_chunk ? position.window_chunk : l_state.all_columns;
+		auto &table_state = position.scan_state.table_state;
+		auto &prepared = table_state.prepared_vector;
+		D_ASSERT(prepared.prepare_state == VectorPrepareState::NONE);
+		scan_chunk.Reset();
+		const auto max_row =
+		    position_data->row_groups->GetBaseRowId() + position_data->row_group_collection->GetNextRowId();
+		PreparePositionScanWindow(transaction, table_state, position_data->positions, window, max_row);
+		if (prepared.visible_count > 0) {
+			D_ASSERT(table_state.row_group);
+			ScanOptions options {TransactionData(transaction)};
+			table_state.row_group->GetNode().ScanPositions(options, table_state, l_state.fetch_state, scan_chunk);
+		} else {
+			prepared.Reset();
+		}
+		if (use_window_chunk) {
+			l_state.all_columns.Append(scan_chunk);
+		}
+		position.next_window_index++;
+	}
+
+	void ScanPositionBatch(ClientContext &context, DuckTransaction &transaction, IndexScanLocalState &l_state,
+	                       DataChunk &output) {
+		auto &position = *l_state.position_state;
+		const auto &batch = position_data->batches[l_state.batch_index];
+		const auto batch_window_end = batch.window_begin + batch.window_count;
+		const bool use_window_chunk = batch.window_count > 1;
+		if (use_window_chunk && position.window_chunk.ColumnCount() == 0) {
+			position.window_chunk.Initialize(context, scanned_types);
+		}
+		while (position.next_window_index < batch_window_end) {
+			if (position.next_window_index > batch.window_begin) {
+				context.InterruptCheck();
+			}
+			ProcessPositionWindow(transaction, l_state, use_window_chunk);
+		}
+
+		position.position_scan_lock.reset();
+		position_data->completed_rows.fetch_add(batch.candidate_count);
+		l_state.rows_scanned += batch.candidate_count;
+		position.next_window_index = DConstants::INVALID_INDEX;
+		if (CanRemoveFilterColumns()) {
+			output.ReferenceColumns(l_state.all_columns, projection_ids);
+		} else {
+			output.Reference(l_state.all_columns);
+		}
+	}
+
+	void PositionScanFunc(ClientContext &context, TableFunctionInput &data_p, IndexScanLocalState &l_state,
+	                      DataChunk &output) {
+		auto &bind_data = data_p.bind_data->Cast<TableScanBindData>();
+		auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
+		auto &tx = DuckTransaction::Get(context, duck_table.catalog);
+		auto &position = *l_state.position_state;
+
+		while (true) {
+			if (position.next_window_index == DConstants::INVALID_INDEX && !l_state.in_charge_of_final_stretch) {
+				const auto batch_index = next_batch_index.fetch_add(1);
+				if (batch_index >= position_data->batches.size()) {
+					if (batch_index != position_data->batches.size()) {
+						return;
+					}
+					l_state.in_charge_of_final_stretch = true;
+					l_state.batch_index = batch_index;
+				} else {
+					l_state.batch_index = batch_index;
+					position.position_scan_lock = position_data->table_info->GetSharedPositionScanLock();
+					position.next_window_index = position_data->batches[batch_index].window_begin;
+					l_state.all_columns.Reset();
+				}
+			}
+
+			if (position.next_window_index == DConstants::INVALID_INDEX) {
+				D_ASSERT(l_state.in_charge_of_final_stretch);
+				ScanLocalStorage(tx, l_state, output);
+				return;
+			}
+			ScanPositionBatch(context, tx, l_state, output);
+			if (output.size() == 0) {
+				if (data_p.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
+					data_p.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+					return;
+				}
+				continue;
+			}
+			return;
+		}
+	}
+
 	double TableScanProgress(ClientContext &context, const FunctionData *bind_data_p) const override {
+		if (position_data) {
+			if (position_data->positions.empty()) {
+				return 100;
+			}
+			const auto scanned_rows = position_data->completed_rows.load();
+			auto percentage =
+			    100 * (static_cast<double>(scanned_rows) / static_cast<double>(position_data->positions.size()));
+			return percentage > 100 ? 100 : percentage;
+		}
 		if (row_id_count == 0) {
 			return 100;
 		}
@@ -518,7 +793,11 @@ unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &cont
 	g_state->finished_first_phase = row_ids.empty() ? true : false;
 	g_state->started_last_phase = false;
 
-	if (!row_ids.empty()) {
+	// Position materialization cannot preserve the dense virtual row-number semantics.
+	const auto use_position_scan = !row_ids.empty() && !Settings::Get<DebugForceFetchRowSetting>(context) &&
+	                               std::none_of(input.column_indexes.begin(), input.column_indexes.end(),
+	                                            [](const auto &column) { return column.IsRowNumberColumn(); });
+	if (!row_ids.empty() && !use_position_scan) {
 		auto row_id_ptr = g_state->arena.AllocateAligned(row_ids.size() * sizeof(row_t));
 		g_state->row_ids = reinterpret_cast<row_t *>(row_id_ptr);
 		g_state->row_id_count = row_ids.size();
@@ -551,6 +830,20 @@ unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &cont
 	auto &no_const_bind_data = bind_data.CastNoConst<TableScanBindData>();
 	no_const_bind_data.is_index_scan = true;
 
+	if (use_position_scan) {
+		auto position_data = make_uniq<PositionScanData>();
+		// ART entry locks are released by TryScanIndex before this point. Acquiring the scan lock here
+		// avoids a lock-order cycle with rollback, which removes index entries before truncating storage.
+		position_data->table_info = duck_table.GetStorage().GetDataTableInfo();
+		auto position_scan_lock = position_data->table_info->GetSharedPositionScanLock();
+		position_data->row_group_collection = duck_table.GetStorage().GetRowGroupCollection();
+		position_data->row_groups = position_data->row_group_collection->GetRowGroups();
+		position_data->positions.assign(row_ids.begin(), row_ids.end());
+		BuildPositionScanPlan(*position_data->row_groups, position_data->positions, position_data->windows,
+		                      position_data->batches);
+		g_state->max_threads = MinValue(g_state->max_threads, position_data->batches.size() + 1);
+		g_state->position_data = std::move(position_data);
+	}
 	return std::move(g_state);
 }
 

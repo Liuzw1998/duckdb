@@ -279,12 +279,18 @@ idx_t FixedSizeFinalizeAppend(ColumnSegment &segment, BaseStatistics &stats) {
 //===--------------------------------------------------------------------===//
 template <class T, class APPENDER = StandardFixedSizeAppend>
 CompressionFunction FixedSizeGetFunction(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_UNCOMPRESSED, data_type, FixedSizeInitAnalyze,
+	CompressionFunction result(CompressionType::COMPRESSION_UNCOMPRESSED, data_type, FixedSizeInitAnalyze,
 	                           FixedSizeAnalyze, FixedSizeFinalAnalyze<T>, UncompressedFunctions::InitCompression,
 	                           UncompressedFunctions::Compress, UncompressedFunctions::FinalizeCompress,
 	                           FixedSizeInitScan, FixedSizeScan<T>, FixedSizeScanPartial<T>, FixedSizeFetchRow<T>,
 	                           UncompressedFunctions::EmptySkip, nullptr, FixedSizeInitAppend,
 	                           FixedSizeAppend<T, APPENDER>, FixedSizeFinalizeAppend<T>);
+	// Keep composite interval/list values on the existing FetchRows path until their position materialization is
+	// supported.
+	if (data_type != PhysicalType::INTERVAL && data_type != PhysicalType::LIST) {
+		result.position_scan_threshold = 3;
+	}
+	return result;
 }
 
 CompressionFunction FixedSizeUncompressed::GetFunction(PhysicalType data_type) {

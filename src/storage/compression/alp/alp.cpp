@@ -14,18 +14,22 @@ CompressionFunction GetAlpFunction(PhysicalType data_type) {
 
 template <>
 CompressionFunction GetAlpFunction<float>(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<float>, AlpAnalyze<float>,
+	CompressionFunction result(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<float>, AlpAnalyze<float>,
 	                           AlpFinalAnalyze<float>, AlpInitCompression<float>, AlpCompress<float>,
 	                           AlpFinalizeCompress<float>, AlpInitScan<float>, AlpScan<float>, AlpScanPartial<float>,
 	                           AlpFetchRow<float>, AlpSkip<float>);
+	result.position_scan_threshold = 3;
+	return result;
 }
 
 template <>
 CompressionFunction GetAlpFunction<double>(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<double>, AlpAnalyze<double>,
+	CompressionFunction result(CompressionType::COMPRESSION_ALP, data_type, AlpInitAnalyze<double>, AlpAnalyze<double>,
 	                           AlpFinalAnalyze<double>, AlpInitCompression<double>, AlpCompress<double>,
 	                           AlpFinalizeCompress<double>, AlpInitScan<double>, AlpScan<double>,
 	                           AlpScanPartial<double>, AlpFetchRow<double>, AlpSkip<double>);
+	result.position_scan_threshold = 3;
+	return result;
 }
 
 CompressionFunction AlpCompressionFun::GetFunction(PhysicalType type) {

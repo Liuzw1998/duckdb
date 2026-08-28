@@ -942,6 +942,10 @@ CompressionFunction GetBitpackingFunction(PhysicalType data_type) {
 	    BitpackingCompress<T, WRITE_STATISTICS>, BitpackingFinalizeCompress<T, WRITE_STATISTICS>, BitpackingInitScan<T>,
 	    BitpackingScan<T>, BitpackingScanPartial<T>, BitpackingFetchRow<T>, BitpackingSkip<T>);
 	bitpacking.get_segment_info = BitpackingGetSegmentInfo<T>;
+	// LIST selection scans the complete nested column, so the scalar threshold does not apply.
+	if (data_type != PhysicalType::LIST) {
+		bitpacking.position_scan_threshold = 1;
+	}
 	return bitpacking;
 }
 

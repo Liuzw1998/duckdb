@@ -15,18 +15,22 @@ CompressionFunction GetAlpRDFunction(PhysicalType data_type) {
 
 template <>
 CompressionFunction GetAlpRDFunction<float>(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_ALPRD, data_type, AlpRDInitAnalyze<float>,
+	CompressionFunction result(CompressionType::COMPRESSION_ALPRD, data_type, AlpRDInitAnalyze<float>,
 	                           AlpRDAnalyze<float>, AlpRDFinalAnalyze<float>, AlpRDInitCompression<float>,
 	                           AlpRDCompress<float>, AlpRDFinalizeCompress<float>, AlpRDInitScan<float>,
 	                           AlpRDScan<float>, AlpRDScanPartial<float>, AlpRDFetchRow<float>, AlpRDSkip<float>);
+	result.position_scan_threshold = 3;
+	return result;
 }
 
 template <>
 CompressionFunction GetAlpRDFunction<double>(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_ALPRD, data_type, AlpRDInitAnalyze<double>,
+	CompressionFunction result(CompressionType::COMPRESSION_ALPRD, data_type, AlpRDInitAnalyze<double>,
 	                           AlpRDAnalyze<double>, AlpRDFinalAnalyze<double>, AlpRDInitCompression<double>,
 	                           AlpRDCompress<double>, AlpRDFinalizeCompress<double>, AlpRDInitScan<double>,
 	                           AlpRDScan<double>, AlpRDScanPartial<double>, AlpRDFetchRow<double>, AlpRDSkip<double>);
+	result.position_scan_threshold = 3;
+	return result;
 }
 
 CompressionFunction AlpRDCompressionFun::GetFunction(PhysicalType type) {

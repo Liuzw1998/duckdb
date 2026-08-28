@@ -275,6 +275,10 @@ public:
 	compression_fetch_row_t fetch_row;
 	//! Skip forward in the compressed segment
 	compression_skip_t skip;
+	//! Minimum selected-row density, expressed as equivalent rows per
+	//! STANDARD_VECTOR_SIZE, for partial-vector materialization.
+	//! Zero disables partial-vector Scan/Select; complete vectors still use Scan.
+	idx_t position_scan_threshold = 0;
 
 	// Append functions
 	//! This only really needs to be defined for uncompressed segments

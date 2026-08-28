@@ -398,6 +398,18 @@ void ColumnData::Select(TransactionData transaction, idx_t vector_index, ColumnS
 	result.Slice(sel, s_count);
 }
 
+bool ColumnData::UsePositionScan(idx_t vector_index, idx_t physical_count, idx_t selected_count) const {
+	D_ASSERT(selected_count > 0 && selected_count <= physical_count);
+	if (selected_count == physical_count) {
+		return true;
+	}
+	const auto compression_function = GetCompressionFunction();
+	// A concurrent append can extend the tail vector after the position window was planned.
+	return compression_function && compression_function->position_scan_threshold > 0 &&
+	       selected_count * STANDARD_VECTOR_SIZE >= compression_function->position_scan_threshold * physical_count &&
+	       GetVectorCount(vector_index) == physical_count;
+}
+
 void ColumnData::Skip(ColumnScanState &state, idx_t s_count) {
 	state.Next(s_count);
 }

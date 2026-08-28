@@ -156,6 +156,8 @@ public:
 	                    SelectionVector &sel, idx_t &count, const TableFilter &filter, TableFilterState &filter_state);
 	virtual void Select(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
 	                    SelectionVector &sel, idx_t count);
+	//! Whether selected positions use Scan or Select rather than FetchRows.
+	bool UsePositionScan(idx_t vector_index, idx_t physical_count, idx_t selected_count) const;
 
 	//! Skip the scan forward by "count" rows
 	virtual void Skip(ColumnScanState &state, idx_t count = STANDARD_VECTOR_SIZE);

@@ -1333,6 +1333,9 @@ void DataTable::CommitAppend(transaction_t commit_id, idx_t row_start, idx_t cou
 
 void DataTable::RevertAppendInternal(idx_t start_row) {
 	D_ASSERT(IsMainTable());
+	// RevertAppendInternal truncates transient RowGroups in place. Keep that mutation away from
+	// position scans, which may retain the current RowGroup tree across asynchronous tasks.
+	auto position_scan_lock = info->GetExclusivePositionScanLock();
 	// revert appends made to row_groups
 	row_groups->RevertAppendInternal(start_row);
 }

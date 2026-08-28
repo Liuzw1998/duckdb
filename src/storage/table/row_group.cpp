@@ -860,6 +860,77 @@ vector<unique_ptr<AsyncTask>> RowGroup::CollectScanIOTasks(CollectionScanState &
 	return GetBlockManager().buffer_manager.CreatePrefetchTasks(state.context, prefetch_state.blocks);
 }
 
+void RowGroup::PreparePositionScan(CollectionScanState &state, SegmentNode<RowGroup> &node, idx_t vector_offset,
+                                   idx_t physical_count, idx_t selected_count) {
+	D_ASSERT(selected_count > 0 && selected_count <= physical_count);
+	D_ASSERT(!state.GetFilterInfo().HasFilters());
+	D_ASSERT(!state.GetSamplingInfo().do_system_sample);
+	const auto row_number = vector_offset * STANDARD_VECTOR_SIZE;
+	const bool same_row_group = state.row_group && RefersToSameObject(*state.row_group, node);
+	state.max_row = node.GetRowEnd();
+	if (!InitializeScanInternal(state, node, vector_offset) || row_number + physical_count > state.max_row_group_row) {
+		throw InternalException("Failed to initialize a planned position scan");
+	}
+	const auto &column_ids = state.GetColumnIds();
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		auto &column_scan = state.column_scans[i];
+		// Scan and Select advance this offset, while FetchRows does not. Only reuse an exactly aligned state.
+		if (!same_row_group || column_scan.offset_in_column != row_number) {
+			GetColumn(column_ids[i]).InitializeScanWithOffset(column_scan, row_number);
+		}
+		column_scan.scan_options = &state.GetOptions();
+	}
+	auto &prepared = state.prepared_vector;
+	prepared.prepare_state = VectorPrepareState::IO_REGISTERED;
+	prepared.max_count = physical_count;
+	prepared.visible_count = selected_count;
+}
+
+void RowGroup::ScanPositions(ScanOptions options, CollectionScanState &state, ColumnFetchState &fetch_state,
+                             DataChunk &result) {
+	D_ASSERT(state.row_group);
+	auto &prepared = state.prepared_vector;
+	D_ASSERT(prepared.prepare_state == VectorPrepareState::IO_REGISTERED);
+	const auto physical_count = prepared.max_count;
+	const auto selected_count = prepared.visible_count;
+	D_ASSERT(selected_count > 0 && selected_count <= physical_count);
+	D_ASSERT(!state.GetFilterInfo().HasFilters());
+	D_ASSERT(!state.GetSamplingInfo().do_system_sample);
+	const auto &column_ids = state.GetColumnIds();
+	auto &position_sel = state.valid_sel;
+	auto &transaction = options.transaction;
+	fetch_state.row_group = state.row_group;
+	idx_t fetch_offsets[STANDARD_VECTOR_SIZE];
+	if (selected_count < physical_count) {
+		const auto vector_start = state.vector_index * STANDARD_VECTOR_SIZE;
+		for (idx_t i = 0; i < selected_count; i++) {
+			fetch_offsets[i] = vector_start + position_sel.get_index(i);
+		}
+	}
+
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		const auto &column = column_ids[i];
+		D_ASSERT(!column.IsRowNumberColumn());
+		auto &column_data = GetColumn(column);
+		auto &column_scan = state.column_scans[i];
+		column_scan.update_scan_type = options.update_type;
+		if (column_data.UsePositionScan(state.vector_index, physical_count, selected_count)) {
+			if (selected_count == physical_count) {
+				column_data.Scan(transaction, state.vector_index, column_scan, result.data[i], physical_count);
+			} else {
+				column_data.Select(transaction, state.vector_index, column_scan, result.data[i], position_sel,
+				                   selected_count);
+			}
+		} else {
+			D_ASSERT(selected_count < physical_count);
+			column_data.FetchRows(transaction, fetch_state, column, fetch_offsets,
+			                      *FlatVector::IncrementalSelectionVector(), selected_count, result.data[i], 0);
+		}
+	}
+	result.SetChildCardinality(selected_count);
+	FinishVector(state);
+}
+
 bool RowGroup::PrepareScan(ScanOptions options, CollectionScanState &state) {
 	auto &prepared = state.prepared_vector;
 	if (prepared.prepare_state != VectorPrepareState::NONE) {
