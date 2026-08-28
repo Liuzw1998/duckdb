@@ -164,6 +164,8 @@ public:
 	//! Initializes a position scan over the selected positions.
 	void PreparePositionScan(CollectionScanState &state, SegmentNode<RowGroup> &node, idx_t vector_offset,
 	                         idx_t physical_count, idx_t selected_count);
+	//! Collects I/O only for columns that scan the selected positions.
+	vector<unique_ptr<AsyncTask>> CollectPositionScanIOTasks(CollectionScanState &state) const;
 	//! Materializes selected positions using each column's Scan, Select, or FetchRows path.
 	void ScanPositions(ScanOptions options, CollectionScanState &state, ColumnFetchState &fetch_state,
 	                   DataChunk &result);

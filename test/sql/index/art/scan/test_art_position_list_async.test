@@ -1,0 +1,65 @@
+# name: test/sql/index/art/scan/test_art_position_list_async.test
+# description: Test asynchronous I/O for ART position-list scans
+# group: [scan]
+
+load {TEST_DIR}/art_position_list_async.db
+
+statement ok
+CREATE TABLE position_async(
+    id BIGINT,
+    bucket INTEGER,
+    payload BIGINT USING COMPRESSION UNCOMPRESSED
+);
+
+statement ok
+INSERT INTO position_async SELECT i, i % 256, i * 3 FROM range(100000) r(i);
+
+statement ok
+CREATE INDEX position_async_bucket ON position_async USING ART(bucket);
+
+statement ok
+CHECKPOINT;
+
+# Reopen the database so the payload blocks start cold.
+restart
+
+statement ok
+SET index_scan_percentage = 1.0;
+
+statement ok
+SET index_scan_max_count = 0;
+
+statement ok
+SET threads = 1;
+
+statement ok
+SET async_threads = 4;
+
+statement ok
+SET storage_block_prefetch = 'debug_force_always';
+
+statement ok
+CALL enable_logging('AsyncTaskSchedule');
+
+query II
+EXPLAIN ANALYZE SELECT count(*), sum(payload) FROM position_async WHERE bucket = 0;
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+SELECT count(*), sum(payload) FROM position_async WHERE bucket = 0;
+----
+391	58556160
+
+query I
+SELECT DISTINCT pool FROM duckdb_logs_parsed('AsyncTaskSchedule');
+----
+ASYNC
+
+query I
+SELECT sum(task_count) > 0 FROM duckdb_logs_parsed('AsyncTaskSchedule');
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();

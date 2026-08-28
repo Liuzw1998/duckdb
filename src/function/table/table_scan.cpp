@@ -419,18 +419,29 @@ public:
 		}
 	}
 
-	void ProcessPositionWindow(DuckTransaction &transaction, IndexScanLocalState &l_state, bool use_window_chunk) {
+	bool ProcessPositionWindow(DuckTransaction &transaction, TableFunctionInput &data_p, IndexScanLocalState &l_state,
+	                           bool use_window_chunk) {
 		auto &position = *l_state.position_state;
 		D_ASSERT(position.position_scan_lock);
 		const auto &window = position_data->windows[position.next_window_index];
 		auto &scan_chunk = use_window_chunk ? position.window_chunk : l_state.all_columns;
 		auto &table_state = position.scan_state.table_state;
 		auto &prepared = table_state.prepared_vector;
-		D_ASSERT(prepared.prepare_state == VectorPrepareState::NONE);
-		scan_chunk.Reset();
-		const auto max_row =
-		    position_data->row_groups->GetBaseRowId() + position_data->row_group_collection->GetNextRowId();
-		PreparePositionScanWindow(transaction, table_state, position_data->positions, window, max_row);
+		if (prepared.prepare_state == VectorPrepareState::NONE) {
+			scan_chunk.Reset();
+			const auto max_row =
+			    position_data->row_groups->GetBaseRowId() + position_data->row_group_collection->GetNextRowId();
+			PreparePositionScanWindow(transaction, table_state, position_data->positions, window, max_row);
+			vector<unique_ptr<AsyncTask>> io_tasks;
+			if (prepared.visible_count > 0) {
+				D_ASSERT(table_state.row_group);
+				io_tasks = table_state.row_group->GetNode().CollectPositionScanIOTasks(table_state);
+			}
+			auto io_result = AsyncResult::FromTasks(std::move(io_tasks), TaskSchedulerType::ASYNC);
+			if (io_result.GetResultType() == AsyncResultType::BLOCKED && data_p.HandleBlocked(io_result)) {
+				return false;
+			}
+		}
 		if (prepared.visible_count > 0) {
 			D_ASSERT(table_state.row_group);
 			ScanOptions options {TransactionData(transaction)};
@@ -442,10 +453,11 @@ public:
 			l_state.all_columns.Append(scan_chunk);
 		}
 		position.next_window_index++;
+		return true;
 	}
 
-	void ScanPositionBatch(ClientContext &context, DuckTransaction &transaction, IndexScanLocalState &l_state,
-	                       DataChunk &output) {
+	bool ScanPositionBatch(ClientContext &context, DuckTransaction &transaction, TableFunctionInput &data_p,
+	                       IndexScanLocalState &l_state, DataChunk &output) {
 		auto &position = *l_state.position_state;
 		const auto &batch = position_data->batches[l_state.batch_index];
 		const auto batch_window_end = batch.window_begin + batch.window_count;
@@ -457,7 +469,9 @@ public:
 			if (position.next_window_index > batch.window_begin) {
 				context.InterruptCheck();
 			}
-			ProcessPositionWindow(transaction, l_state, use_window_chunk);
+			if (!ProcessPositionWindow(transaction, data_p, l_state, use_window_chunk)) {
+				return false;
+			}
 		}
 
 		position.position_scan_lock.reset();
@@ -469,6 +483,7 @@ public:
 		} else {
 			output.Reference(l_state.all_columns);
 		}
+		return true;
 	}
 
 	void PositionScanFunc(ClientContext &context, TableFunctionInput &data_p, IndexScanLocalState &l_state,
@@ -477,6 +492,15 @@ public:
 		auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
 		auto &tx = DuckTransaction::Get(context, duck_table.catalog);
 		auto &position = *l_state.position_state;
+
+#ifdef DUCKDB_DEBUG_ASYNC_SINK_SOURCE
+		{
+			AsyncResult test_result;
+			if (AsyncResult::TryGenerateTestResult(test_result) && data_p.HandleBlocked(test_result)) {
+				return;
+			}
+		}
+#endif
 
 		while (true) {
 			if (position.next_window_index == DConstants::INVALID_INDEX && !l_state.in_charge_of_final_stretch) {
@@ -500,7 +524,9 @@ public:
 				ScanLocalStorage(tx, l_state, output);
 				return;
 			}
-			ScanPositionBatch(context, tx, l_state, output);
+			if (!ScanPositionBatch(context, tx, data_p, l_state, output)) {
+				return;
+			}
 			if (output.size() == 0) {
 				if (data_p.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
 					data_p.async_result = AsyncResultType::HAVE_MORE_OUTPUT;

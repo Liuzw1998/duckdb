@@ -886,6 +886,24 @@ void RowGroup::PreparePositionScan(CollectionScanState &state, SegmentNode<RowGr
 	prepared.visible_count = selected_count;
 }
 
+vector<unique_ptr<AsyncTask>> RowGroup::CollectPositionScanIOTasks(CollectionScanState &state) const {
+	auto &prepared = state.prepared_vector;
+	D_ASSERT(prepared.prepare_state == VectorPrepareState::IO_REGISTERED);
+	D_ASSERT(prepared.visible_count > 0 && prepared.visible_count <= prepared.max_count);
+	PrefetchState prefetch_state;
+	if (!GetBlockManager().Prefetch()) {
+		return vector<unique_ptr<AsyncTask>>();
+	}
+	const auto &column_ids = state.GetColumnIds();
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		auto &column = GetColumn(column_ids[i]);
+		if (column.UsePositionScan(state.vector_index, prepared.max_count, prepared.visible_count)) {
+			column.InitializePrefetch(prefetch_state, state.column_scans[i], prepared.max_count);
+		}
+	}
+	return GetBlockManager().buffer_manager.CreatePrefetchTasks(state.context, prefetch_state.blocks);
+}
+
 void RowGroup::ScanPositions(ScanOptions options, CollectionScanState &state, ColumnFetchState &fetch_state,
                              DataChunk &result) {
 	D_ASSERT(state.row_group);
