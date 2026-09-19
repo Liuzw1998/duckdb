@@ -26,6 +26,8 @@ class ExpressionFilter;
 class ColumnSegment;
 class DatabaseInstance;
 class PartialBlockManager;
+enum class PartialBlockType;
+enum class CheckpointType;
 class DuckTableEntry;
 struct ColumnCheckpointState;
 struct ColumnSegmentInfo;
@@ -41,6 +43,8 @@ struct RowGroupWriteInfo;
 struct TableScanOptions;
 struct TransactionData;
 struct PersistentColumnData;
+struct CheckpointUpdateData;
+struct PersistentUpdateData;
 class ValidityColumnData;
 struct ColumnDataFinalizeAppendState;
 struct SuballocationBlock;
@@ -55,6 +59,9 @@ struct ColumnCheckpointInfo {
 public:
 	PartialBlockManager &GetPartialBlockManager();
 	CompressionType GetCompressionType();
+	CheckpointType GetCheckpointType() const;
+	VisibilityBound GetVisibilityBound() const;
+	PartialBlockType GetPartialBlockType() const;
 
 private:
 	RowGroupWriteInfo &info;
@@ -135,6 +142,11 @@ public:
 
 	//! Whether or not the column has ANY changes, including in child columns
 	virtual bool HasAnyChanges() const;
+	//! Whether or not the column has changes that are not represented by the persisted snapshot
+	virtual bool HasUncheckpointedChanges() const;
+	bool HasUncheckpointedUpdates() const;
+	bool ExportCheckpointUpdates(CheckpointUpdateData &result, idx_t max_entries) const;
+	void RestoreCheckpointUpdates(const CheckpointUpdateData &snapshot);
 	//! Whether or not we can scan an entire vector
 	virtual ScanVectorType GetVectorScanType(ColumnScanState &state, idx_t scan_count, Vector &result);
 
@@ -211,6 +223,8 @@ public:
 	virtual void InitializeColumn(PersistentColumnData &column_data, BaseStatistics &target_stats);
 	static shared_ptr<ColumnData> Deserialize(BlockManager &block_manager, DataTableInfo &info, idx_t column_index,
 	                                          ReadStream &source, const LogicalType &type);
+	static PersistentColumnData DeserializePersistent(BlockManager &block_manager, DataTableInfo &info,
+	                                                  ReadStream &source, const LogicalType &type);
 
 	virtual void GetColumnSegmentInfo(const QueryContext &context, idx_t row_group_index, vector<idx_t> col_path,
 	                                  vector<ColumnSegmentInfo> &result, const ColumnSegmentInfoScanOptions &options);
@@ -394,6 +408,8 @@ public:
 	vector<DataPointer> pointers;
 	vector<PersistentColumnData> child_columns;
 	bool has_updates = false;
+	//! Consumable descriptor supplied by the reader.
+	unique_ptr<PersistentUpdateData> persistent_updates;
 
 	//! Extra persistent data for specific column types
 	unique_ptr<ExtraPersistentColumnData> extra_data;
@@ -418,6 +434,24 @@ struct PersistentRowGroupData {
 	void Serialize(Serializer &serializer) const;
 	static PersistentRowGroupData Deserialize(Deserializer &deserializer);
 	bool HasUpdates() const;
+};
+
+struct PersistentUpdateData {
+	PersistentUpdateData() = default;
+	PersistentUpdateData(const PersistentUpdateData &) = delete;
+	PersistentUpdateData &operator=(const PersistentUpdateData &) = delete;
+	PersistentUpdateData(PersistentUpdateData &&) noexcept = default;
+	PersistentUpdateData &operator=(PersistentUpdateData &&) noexcept = default;
+
+	void Serialize(Serializer &serializer) const;
+	static unique_ptr<PersistentUpdateData> Deserialize(Deserializer &deserializer);
+	void ValidateDescriptorTypes(const LogicalType &type) const;
+	void VisitBlockIds(BlockIdVisitor &visitor) const;
+
+	optional<PersistentColumnData> value_positions;
+	optional<PersistentColumnData> value_data;
+	optional<PersistentColumnData> validity_positions;
+	optional<PersistentColumnData> validity_data;
 };
 
 struct PersistentCollectionData {

@@ -11,6 +11,7 @@
 #include "duckdb/storage/storage_lock.hpp"
 #include "duckdb/storage/statistics/segment_statistics.hpp"
 #include "duckdb/common/types/string_heap.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/transaction/undo_buffer_allocator.hpp"
 #include "duckdb/transaction/transaction_data.hpp"
 
@@ -24,6 +25,16 @@ struct UpdateInfo;
 struct UpdateNode;
 struct UndoBufferAllocator;
 
+struct CheckpointUpdateData {
+	explicit CheckpointUpdateData(const LogicalType &type) : type(type) {
+	}
+	void Validate(idx_t row_count) const;
+
+	LogicalType type;
+	vector<idx_t> positions;
+	vector<Value> values;
+};
+
 class UpdateSegment {
 public:
 	explicit UpdateSegment(ColumnData &column_data);
@@ -33,6 +44,7 @@ public:
 
 public:
 	bool HasUpdates() const;
+	bool HasUncheckpointedUpdates() const;
 	bool HasUncommittedUpdates(idx_t vector_index);
 	bool HasUpdates(idx_t vector_index) const;
 	bool HasUpdates(idx_t start_row_idx, idx_t end_row_idx);
@@ -48,6 +60,9 @@ public:
 	void RollbackUpdate(UpdateInfo &info);
 	void CleanupUpdateInternal(const StorageLockKey &lock, UpdateInfo &info);
 	void CleanupUpdate(UpdateInfo &info);
+	//! The caller must hold the formal FULL checkpoint boundary while exporting the current root.
+	bool ExportCheckpointUpdates(CheckpointUpdateData &result, idx_t max_entries) const;
+	void RestoreCheckpointUpdates(const CheckpointUpdateData &snapshot);
 
 	unique_ptr<BaseStatistics> GetStatistics();
 	StringHeap &GetStringHeap() {
@@ -59,6 +74,8 @@ private:
 	mutable StorageLock lock;
 	//! The root node (if any)
 	unique_ptr<UpdateNode> root;
+	//! Whether the root contains changes not represented by the persisted snapshot
+	bool has_uncheckpointed_updates = false;
 	//! Update statistics
 	SegmentStatistics stats;
 	//! Stats lock

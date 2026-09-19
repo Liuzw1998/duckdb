@@ -20,6 +20,7 @@
 namespace duckdb {
 
 struct ParallelTableScanState;
+struct BlockIdVisitor;
 struct ParallelCollectionScanState;
 class CreateIndexScanState;
 class CollectionScanState;
@@ -171,6 +172,7 @@ public:
 	vector<ColumnSegmentInfo>
 	GetColumnSegmentInfo(const QueryContext &context,
 	                     const ColumnSegmentInfoScanOptions &options = ColumnSegmentInfoScanOptions {}) const;
+	void VisitPersistentDeltaBlockIds(BlockIdVisitor &visitor) const;
 	//! Initialize an incremental scan over column segment info, pinning the current row groups for consistency.
 	void InitializeColumnSegmentInfoScan(ColumnSegmentInfoScanState &state) const;
 	//! Append the next row group's column segment info to result. Returns false when no row groups remain.

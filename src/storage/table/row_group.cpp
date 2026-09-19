@@ -33,6 +33,7 @@
 #include "duckdb/main/settings.hpp"
 
 #include "duckdb/common/storage_compatibility.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
@@ -1447,6 +1448,18 @@ CompressionType ColumnCheckpointInfo::GetCompressionType() {
 	return info.compression_types[column_idx];
 }
 
+CheckpointType ColumnCheckpointInfo::GetCheckpointType() const {
+	return info.GetCheckpointType();
+}
+
+VisibilityBound ColumnCheckpointInfo::GetVisibilityBound() const {
+	return info.GetVisibilityBound();
+}
+
+PartialBlockType ColumnCheckpointInfo::GetPartialBlockType() const {
+	return info.GetPartialBlockManager(column_idx).GetPartialBlockType();
+}
+
 shared_ptr<ColumnData> RowGroup::CheckpointColumn(const RowGroup &row_group, idx_t column_idx, RowGroupWriteInfo &info,
                                                   RowGroupWriteData &write_data) {
 	auto &column = row_group.GetColumn(column_idx);
@@ -1571,7 +1584,7 @@ PerColumnMetadataBlocks RowGroup::ComputePerColumnMetadataBlocks() const {
 		auto &start = column_pointers[i];
 		vector<MetaBlockPointer> col_read_pointers;
 		MetadataReader col_reader(metadata_manager, start, &col_read_pointers);
-		ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), i, col_reader, types[i]);
+		ColumnData::DeserializePersistent(GetBlockManager(), GetTableInfo(), col_reader, types[i]);
 		vector<idx_t> extra_blocks;
 		for (auto &ptr : col_read_pointers) {
 			if (ptr.block_pointer != start.block_pointer) {
@@ -1633,7 +1646,9 @@ bool RowGroup::HasUnchangedColumns() const {
 
 RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 	bool can_reuse_metadata = CanReuseMetadata(writer);
-	if (can_reuse_metadata && !HasChanges()) {
+	bool supports_persistent_delta = !StorageManager::IsPriorToVersion(
+	    StorageVersion::V2_1_0, GetCollection().GetAttached().GetStorageManager().GetStorageVersion());
+	if (can_reuse_metadata && (!HasChanges() || (supports_persistent_delta && !HasUncheckpointedChanges()))) {
 		RowGroupWriteData result;
 		result.write_action = RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA;
 		if (GetCollection().SupportsPerColumnWrites()) {
@@ -1698,7 +1713,8 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 		if (partial_reuse) {
 			if (!ColumnIsLoaded(column_idx)) {
 				column_has_changes = false;
-			} else if (!columns[column_idx]->HasAnyChanges()) {
+			} else if (!columns[column_idx]->HasAnyChanges() ||
+			           (supports_persistent_delta && !columns[column_idx]->HasUncheckpointedChanges())) {
 				column_has_changes = false;
 			}
 		}
@@ -1937,6 +1953,25 @@ bool RowGroup::HasChanges() const {
 			continue;
 		}
 		if (columns[c]->HasAnyChanges()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool RowGroup::HasUncheckpointedChanges() const {
+	if (has_changes) {
+		return true;
+	}
+	auto version_info_loaded = version_info.load();
+	if (version_info_loaded && version_info_loaded->HasUnserializedChanges()) {
+		return true;
+	}
+	for (idx_t c = 0; c < columns.size(); c++) {
+		if (!ColumnIsLoaded(c)) {
+			continue;
+		}
+		if (columns[c]->HasUncheckpointedChanges()) {
 			return true;
 		}
 	}

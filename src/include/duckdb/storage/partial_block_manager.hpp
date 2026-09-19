@@ -120,6 +120,8 @@ public:
 
 	//! Flush any remaining partial blocks to disk
 	void FlushPartialBlocks();
+	//! Keep checkpoint target columns alive until all partial blocks have been flushed or rolled back.
+	void RegisterCheckpointColumnOwner(shared_ptr<ColumnData> owner);
 
 	unique_ptr<PartialBlock> CreatePartialBlock(ColumnData &data, ColumnSegment &segment, PartialBlockState state,
 	                                            BlockManager &block_manager);
@@ -128,6 +130,9 @@ public:
 		return unique_lock<mutex>(partial_block_lock);
 	}
 	block_id_t GetFreeBlockId();
+	PartialBlockType GetPartialBlockType() const {
+		return partial_block_type;
+	}
 
 	//! Returns a reference to the underlying block manager.
 	BlockManager &GetBlockManager() const;
@@ -147,6 +152,7 @@ protected:
 	//! This is a multimap because there might be outstanding partial blocks with
 	//! the same amount of left-over space
 	multimap<idx_t, unique_ptr<PartialBlock>> partially_filled_blocks;
+	vector<shared_ptr<ColumnData>> checkpoint_column_owners;
 
 	//! The maximum size (in bytes) at which a partial block will be considered a partial block
 	uint32_t max_partial_block_size;

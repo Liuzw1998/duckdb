@@ -13,9 +13,24 @@
 
 namespace duckdb {
 
+struct PersistentUpdateColumns {
+	shared_ptr<ColumnData> value_positions;
+	shared_ptr<ColumnData> value_data;
+	shared_ptr<ColumnData> validity_positions;
+	shared_ptr<ColumnData> validity_data;
+
+	bool HasValueDelta() const {
+		return value_positions && value_data;
+	}
+	bool HasValidityDelta() const {
+		return validity_positions && validity_data;
+	}
+};
+
 //! Standard column data represents a regular flat column (e.g. a column of type INTEGER or STRING)
 class StandardColumnData : public ColumnData {
 public:
+	using ColumnData::InitializeColumn;
 	StandardColumnData(BlockManager &block_manager, DataTableInfo &info, idx_t column_index, LogicalType type,
 	                   ColumnDataType data_type, optional_ptr<ColumnData> parent);
 
@@ -66,18 +81,35 @@ public:
 
 	bool IsPersistent() override;
 	bool HasAnyChanges() const override;
+	bool HasUncheckpointedChanges() const override;
 	PersistentColumnData Serialize() override;
 	void InitializeColumn(PersistentColumnData &column_data, BaseStatistics &target_stats) override;
 
 	void Verify(RowGroup &parent) override;
 
 	void SetValidityData(shared_ptr<ValidityColumnData> validity);
+	void SetPersistentUpdateColumns(shared_ptr<PersistentUpdateColumns> updates);
+	void SetPersistentUpdateSnapshot(unique_ptr<PersistentUpdateData> snapshot);
+	unique_ptr<PersistentUpdateData> TakePersistentUpdateSnapshot();
+	void VisitPersistentDeltaBlockIds(BlockIdVisitor &visitor) const;
+	void VisitPersistentValueDeltaBlockIds(BlockIdVisitor &visitor) const;
+	void VisitPersistentValidityDeltaBlockIds(BlockIdVisitor &visitor) const;
+	const shared_ptr<PersistentUpdateColumns> &GetPersistentUpdateColumns() const {
+		return persistent_updates;
+	}
+	bool HasValidityData() const {
+		return validity != nullptr;
+	}
 	//! Direct access to the validity column data. Intended for extensions that need to walk storage internals.
 	ValidityColumnData &GetValidityData();
 
 protected:
 	//! The validity column data
 	shared_ptr<ValidityColumnData> validity;
+	//! Immutable descriptor retained even when later updates make the runtime root dirty.
+	shared_ptr<PersistentUpdateColumns> persistent_updates;
+	//! Descriptor captured before auxiliary partial blocks are flushed.
+	unique_ptr<PersistentUpdateData> persistent_update_snapshot;
 };
 
 } // namespace duckdb

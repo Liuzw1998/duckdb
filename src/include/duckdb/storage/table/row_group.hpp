@@ -76,6 +76,12 @@ public:
 
 public:
 	PartialBlockManager &GetPartialBlockManager(idx_t column_idx);
+	CheckpointType GetCheckpointType() const {
+		return options.type;
+	}
+	VisibilityBound GetVisibilityBound() const {
+		return options.visibility_bound;
+	}
 
 private:
 	optional_ptr<vector<unique_ptr<PartialBlockManager>>> column_partial_block_managers;
@@ -147,6 +153,7 @@ public:
 
 	void InitializeEmpty(const vector<LogicalType> &types, ColumnDataType data_type);
 	bool HasChanges() const;
+	bool HasUncheckpointedChanges() const;
 
 	//! Initialize a scan over this row_group
 	bool InitializeScan(CollectionScanState &state, SegmentNode<RowGroup> &node);

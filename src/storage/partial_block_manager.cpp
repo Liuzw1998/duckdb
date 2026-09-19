@@ -54,6 +54,7 @@ PartialBlockManager::PartialBlockManager(QueryContext context, BlockManager &blo
 }
 
 PartialBlockManager::~PartialBlockManager() {
+	Rollback();
 }
 
 PartialBlockAllocation PartialBlockManager::GetBlockAllocation(uint32_t segment_size) {
@@ -163,6 +164,10 @@ void PartialBlockManager::Merge(PartialBlockManager &other) {
 	if (&other == this) {
 		throw InternalException("Cannot merge into itself");
 	}
+	for (auto &owner : other.checkpoint_column_owners) {
+		checkpoint_column_owners.push_back(std::move(owner));
+	}
+	other.checkpoint_column_owners.clear();
 	// for each partially filled block in the other manager, check if we can merge it into an existing block in this
 	// manager
 	for (auto &e : other.partially_filled_blocks) {
@@ -199,6 +204,15 @@ void PartialBlockManager::FlushPartialBlocks() {
 		e.second->Flush(context, e.first);
 	}
 	partially_filled_blocks.clear();
+	checkpoint_column_owners.clear();
+}
+
+void PartialBlockManager::RegisterCheckpointColumnOwner(shared_ptr<ColumnData> owner) {
+	if (!owner) {
+		throw InternalException("Cannot register an empty checkpoint column owner");
+	}
+	lock_guard<mutex> guard(partial_block_lock);
+	checkpoint_column_owners.push_back(std::move(owner));
 }
 
 BlockManager &PartialBlockManager::GetBlockManager() const {
@@ -211,6 +225,7 @@ optional_ptr<ClientContext> PartialBlockManager::GetClientContext() const {
 
 void PartialBlockManager::Rollback() {
 	ClearBlocks();
+	checkpoint_column_owners.clear();
 }
 
 } // namespace duckdb

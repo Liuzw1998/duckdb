@@ -305,6 +305,14 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 		for (auto &info : metadata_info) {
 			verify_block_usage_count[info.block_id]++;
 		}
+		struct DeltaBlockUsageVisitor : public BlockIdVisitor {
+			explicit DeltaBlockUsageVisitor(unordered_map<block_id_t, idx_t> &usage) : usage(usage) {
+			}
+			void Visit(block_id_t block_id) override {
+				usage[block_id]++;
+			}
+			unordered_map<block_id_t, idx_t> &usage;
+		} delta_visitor(verify_block_usage_count);
 		for (auto &entry_ref : catalog_entries) {
 			auto &entry = entry_ref.get();
 			if (entry.type != CatalogType::TABLE_ENTRY) {
@@ -324,6 +332,7 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 					}
 				}
 			}
+			storage.GetRowGroupCollection()->VisitPersistentDeltaBlockIds(delta_visitor);
 		}
 		block_manager.VerifyBlocks(verify_block_usage_count);
 	}

@@ -7,6 +7,7 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
+#include "duckdb/storage/table/standard_column_data.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/update_segment.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -294,6 +295,9 @@ void ColumnDataCheckpointer::DropSegments() {
 		CheckpointBlockIdDropper dropper(storage_manager.GetBlockManager());
 		for (auto &segment : col_data.data.Segments()) {
 			segment.VisitBlockIds(dropper);
+		}
+		if (i == 0 && (col_data.type.id() == LogicalTypeId::INTEGER || col_data.type.id() == LogicalTypeId::BIGINT)) {
+			col_data.Cast<StandardColumnData>().VisitPersistentDeltaBlockIds(dropper);
 		}
 	}
 }

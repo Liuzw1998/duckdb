@@ -123,6 +123,34 @@ bool ColumnData::HasAnyChanges() const {
 	return HasChanges();
 }
 
+bool ColumnData::HasUncheckpointedChanges() const {
+	return HasAnyChanges();
+}
+
+bool ColumnData::HasUncheckpointedUpdates() const {
+	lock_guard<mutex> update_guard(update_lock);
+	return updates && updates->HasUncheckpointedUpdates();
+}
+
+bool ColumnData::ExportCheckpointUpdates(CheckpointUpdateData &result, idx_t max_entries) const {
+	lock_guard<mutex> update_guard(update_lock);
+	return !updates || updates->ExportCheckpointUpdates(result, max_entries);
+}
+
+void ColumnData::RestoreCheckpointUpdates(const CheckpointUpdateData &snapshot) {
+	lock_guard<mutex> update_guard(update_lock);
+	if (updates) {
+		throw InternalException("Cannot restore updates into an existing update segment");
+	}
+	snapshot.Validate(count);
+	if (snapshot.positions.empty()) {
+		return;
+	}
+	auto restored = make_uniq<UpdateSegment>(*this);
+	restored->RestoreCheckpointUpdates(snapshot);
+	updates = std::move(restored);
+}
+
 idx_t ColumnData::GetMaxEntry() {
 	return count;
 }
@@ -968,6 +996,48 @@ PersistentColumnData::PersistentColumnData(const LogicalType &logical_type_p, ve
 PersistentColumnData::~PersistentColumnData() {
 }
 
+void PersistentUpdateData::Serialize(Serializer &serializer) const {
+	serializer.WritePropertyWithDefault(100, "value_positions", value_positions);
+	serializer.WritePropertyWithDefault(101, "value_data", value_data);
+	serializer.WritePropertyWithDefault(102, "validity_positions", validity_positions);
+	serializer.WritePropertyWithDefault(103, "validity_data", validity_data);
+}
+
+unique_ptr<PersistentUpdateData> PersistentUpdateData::Deserialize(Deserializer &deserializer) {
+	auto result = make_uniq<PersistentUpdateData>();
+	const auto &parent_type = deserializer.Get<const LogicalType &>();
+	LogicalType position_type = LogicalType::UBIGINT;
+	LogicalType validity_type = LogicalType::BOOLEAN;
+	auto read = [&](field_id_t field_id, const char *name, const LogicalType &type) {
+		deserializer.Set<const LogicalType &>(type);
+		auto value =
+		    deserializer.ReadPropertyWithExplicitDefault<optional<PersistentColumnData>>(field_id, name, nullopt);
+		deserializer.Unset<LogicalType>();
+		return value;
+	};
+	result->value_positions = read(100, "value_positions", position_type);
+	result->value_data = read(101, "value_data", parent_type);
+	result->validity_positions = read(102, "validity_positions", position_type);
+	result->validity_data = read(103, "validity_data", validity_type);
+	return result;
+}
+
+void PersistentUpdateData::ValidateDescriptorTypes(const LogicalType &type) const {
+	if ((value_positions.has_value() != value_data.has_value()) ||
+	    (validity_positions.has_value() != validity_data.has_value())) {
+		throw SerializationException("Persistent delta descriptor has an incomplete stream");
+	}
+	auto validate_type = [&](const optional<PersistentColumnData> &descriptor, const LogicalType &expected) {
+		if (descriptor && descriptor->logical_type != expected) {
+			throw SerializationException("Persistent delta descriptor has an unexpected logical type");
+		}
+	};
+	validate_type(value_positions, LogicalType::UBIGINT);
+	validate_type(value_data, type);
+	validate_type(validity_positions, LogicalType::UBIGINT);
+	validate_type(validity_data, LogicalType::BOOLEAN);
+}
+
 void PersistentColumnData::Serialize(Serializer &serializer) const {
 	if (has_updates) {
 		throw InternalException("Column data with updates cannot be serialized");
@@ -1008,6 +1078,9 @@ void PersistentColumnData::Serialize(Serializer &serializer) const {
 		serializer.WritePropertyWithDefault(100, "data_pointers", pointers);
 		serializer.WriteProperty(101, "validity", child_columns[0]);
 	} break;
+	}
+	if (persistent_updates && serializer.ShouldSerialize(StorageVersion::V2_1_0)) {
+		serializer.WritePropertyWithDefault(104, "persistent_updates", persistent_updates);
 	}
 }
 
@@ -1136,11 +1209,13 @@ PersistentColumnData PersistentColumnData::Deserialize(Deserializer &deserialize
 		result.DeserializeField(deserializer, 101, "validity", LogicalTypeId::VALIDITY);
 	} break;
 	}
+	result.persistent_updates = deserializer.ReadPropertyWithExplicitDefault<unique_ptr<PersistentUpdateData>>(
+	    104, "persistent_updates", nullptr);
 	return result;
 }
 
 bool PersistentColumnData::HasUpdates() const {
-	if (has_updates) {
+	if (has_updates || persistent_updates) {
 		return true;
 	}
 	for (auto &child_col : child_columns) {
@@ -1217,7 +1292,42 @@ static void TraverseBlocksRecursive(const PersistentColumnData &col_data, vector
 	for (auto &child_column : col_data.child_columns) {
 		TraverseBlocksRecursive(child_column, result);
 	}
+	if (col_data.persistent_updates) {
+		auto &updates = *col_data.persistent_updates;
+		if (updates.value_positions) {
+			TraverseBlocksRecursive(*updates.value_positions, result);
+		}
+		if (updates.value_data) {
+			TraverseBlocksRecursive(*updates.value_data, result);
+		}
+		if (updates.validity_positions) {
+			TraverseBlocksRecursive(*updates.validity_positions, result);
+		}
+		if (updates.validity_data) {
+			TraverseBlocksRecursive(*updates.validity_data, result);
+		}
+	}
 }
+
+void PersistentUpdateData::VisitBlockIds(BlockIdVisitor &visitor) const {
+	vector<block_id_t> block_ids;
+	if (value_positions) {
+		TraverseBlocksRecursive(*value_positions, block_ids);
+	}
+	if (value_data) {
+		TraverseBlocksRecursive(*value_data, block_ids);
+	}
+	if (validity_positions) {
+		TraverseBlocksRecursive(*validity_positions, block_ids);
+	}
+	if (validity_data) {
+		TraverseBlocksRecursive(*validity_data, block_ids);
+	}
+	for (auto block_id : block_ids) {
+		visitor.Visit(block_id);
+	}
+}
+
 vector<block_id_t> PersistentCollectionData::GetBlockIds() const {
 	vector<block_id_t> result;
 	for (auto &group : row_group_data) {
@@ -1271,7 +1381,13 @@ PersistentColumnData ColumnData::Serialize() {
 shared_ptr<ColumnData> ColumnData::Deserialize(BlockManager &block_manager, DataTableInfo &info, idx_t column_index,
                                                ReadStream &source, const LogicalType &type) {
 	auto entry = ColumnData::CreateColumn(block_manager, info, column_index, type);
+	auto persistent_column_data = DeserializePersistent(block_manager, info, source, type);
+	entry->InitializeColumn(persistent_column_data, entry->stats->statistics);
+	return entry;
+}
 
+PersistentColumnData ColumnData::DeserializePersistent(BlockManager &block_manager, DataTableInfo &info,
+                                                       ReadStream &source, const LogicalType &type) {
 	// deserialize the persistent column data
 	BinaryDeserializer deserializer(source);
 	deserializer.Begin();
@@ -1291,9 +1407,7 @@ shared_ptr<ColumnData> ColumnData::Deserialize(BlockManager &block_manager, Data
 	deserializer.Unset<DatabaseInstance>();
 	deserializer.End();
 
-	// initialize the column
-	entry->InitializeColumn(persistent_column_data, entry->stats->statistics);
-	return entry;
+	return persistent_column_data;
 }
 
 struct ListBlockIds : public BlockIdVisitor {

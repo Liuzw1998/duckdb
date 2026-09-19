@@ -28,6 +28,7 @@ shared_ptr<ColumnData> ColumnCheckpointState::CreateEmptyColumnData() {
 ColumnData &ColumnCheckpointState::GetResultColumn() {
 	if (!result_column) {
 		result_column = CreateEmptyColumnData();
+		partial_block_manager.RegisterCheckpointColumnOwner(result_column);
 	}
 	return *result_column;
 }
@@ -150,7 +151,6 @@ void ColumnCheckpointState::FlushSegmentInternal(unique_ptr<ColumnSegment> segme
 
 	// Merge the segment statistics into the global statistics.
 	global_stats->Merge(segment->GetStats());
-
 	block_id_t block_id = INVALID_BLOCK;
 	uint32_t offset_in_block = 0;
 

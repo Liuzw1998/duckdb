@@ -22,6 +22,7 @@
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/standard_column_data.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
@@ -1915,7 +1916,7 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 					deserialized_extras.emplace_back();
 					vector<MetaBlockPointer> col_read_pointers;
 					MetadataReader reader(mm, column_start_ptrs[i], &col_read_pointers);
-					ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), i, reader, col_types[i]);
+					ColumnData::DeserializePersistent(GetBlockManager(), GetTableInfo(), reader, col_types[i]);
 					// collect extra blocks from deserialization (excluding start block)
 					for (auto &ptr : col_read_pointers) {
 						if (ptr.block_pointer != column_start_ptrs[i].block_pointer) {
@@ -1971,7 +1972,7 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 			auto &metadata_manager = row_group.GetCollection().GetMetadataManager();
 			for (idx_t i = 0; i < column_start_pointers.size(); i++) {
 				MetadataReader reader(metadata_manager, column_start_pointers[i], &all_full_read_blocks);
-				ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), i, reader, column_types[i]);
+				ColumnData::DeserializePersistent(GetBlockManager(), GetTableInfo(), reader, column_types[i]);
 			}
 
 			// Derive sets of blocks to compare
@@ -2150,6 +2151,30 @@ vector<ColumnSegmentInfo> RowGroupCollection::GetColumnSegmentInfo(const QueryCo
 	while (ScanColumnSegmentInfo(context, state, result)) {
 	}
 	return result;
+}
+
+void RowGroupCollection::VisitPersistentDeltaBlockIds(BlockIdVisitor &visitor) const {
+	for (auto &entry : GetRowGroups()->SegmentNodes()) {
+		auto &row_group = entry.GetNode();
+		const auto &column_pointers = row_group.GetColumnStartPointers();
+		for (idx_t column_idx = 0; column_idx < row_group.GetColumnCount(); column_idx++) {
+			if (GetTypes()[column_idx].id() != LogicalTypeId::INTEGER &&
+			    GetTypes()[column_idx].id() != LogicalTypeId::BIGINT) {
+				continue;
+			}
+			if (column_idx < column_pointers.size()) {
+				MetadataReader reader(row_group.GetBlockManager().GetMetadataManager(), column_pointers[column_idx]);
+				auto persistent_data = ColumnData::DeserializePersistent(
+				    row_group.GetBlockManager(), row_group.GetTableInfo(), reader, GetTypes()[column_idx]);
+				if (persistent_data.persistent_updates) {
+					persistent_data.persistent_updates->VisitBlockIds(visitor);
+				}
+				continue;
+			}
+			auto &column = row_group.GetRawColumnData(column_idx);
+			column.Cast<StandardColumnData>().VisitPersistentDeltaBlockIds(visitor);
+		}
+	}
 }
 
 void RowGroupCollection::InitializeColumnSegmentInfoScan(ColumnSegmentInfoScanState &state) const {

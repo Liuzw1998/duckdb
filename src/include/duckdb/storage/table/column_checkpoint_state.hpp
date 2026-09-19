@@ -43,6 +43,10 @@ public:
 	virtual shared_ptr<ColumnData> CreateEmptyColumnData();
 	virtual ColumnData &GetResultColumn();
 	virtual shared_ptr<ColumnData> GetFinalResult();
+	void SetResultColumn(shared_ptr<ColumnData> result) {
+		result_column = std::move(result);
+		partial_block_manager.RegisterCheckpointColumnOwner(result_column);
+	}
 
 	virtual unique_ptr<BaseStatistics> GetStatistics();
 

@@ -633,6 +633,7 @@ void UpdateSegment::RollbackUpdate(UpdateInfo &info) {
 	}
 	auto pin = entry.Pin();
 	rollback_update_function(UpdateInfo::Get(pin), info);
+	has_uncheckpointed_updates = true;
 
 	// clean up the update chain
 	CleanupUpdateInternal(*lock_handle, info);
@@ -1533,10 +1534,146 @@ void UpdateSegment::Update(TransactionData transaction, DuckTableEntry &table_en
 
 		root->info[vector_index] = handle.GetBufferPointer();
 	}
+	has_uncheckpointed_updates = true;
 }
 
 bool UpdateSegment::HasUpdates() const {
 	return root.get() != nullptr;
+}
+
+bool UpdateSegment::HasUncheckpointedUpdates() const {
+	auto read_lock = lock.GetSharedLock();
+	return has_uncheckpointed_updates;
+}
+
+void CheckpointUpdateData::Validate(idx_t row_count) const {
+	if (type != LogicalType::INTEGER && type != LogicalType::BIGINT && type != LogicalType::BOOLEAN) {
+		throw SerializationException("Unsupported persistent update type: %s", type.ToString());
+	}
+	if (positions.size() != values.size() || positions.size() > row_count) {
+		throw SerializationException("Persistent update positions and values have inconsistent lengths");
+	}
+	for (idx_t i = 0; i < positions.size(); i++) {
+		if (positions[i] >= row_count || (i > 0 && positions[i] <= positions[i - 1])) {
+			throw SerializationException(
+			    "Persistent update positions must be sorted, unique and within the base column");
+		}
+		if (values[i].IsNull() || values[i].type() != type) {
+			throw SerializationException("Persistent update values must have the expected type and cannot be NULL");
+		}
+	}
+}
+
+bool UpdateSegment::ExportCheckpointUpdates(CheckpointUpdateData &result, idx_t max_entries) const {
+	auto expected_type = column_data.type.id() == LogicalTypeId::VALIDITY ? LogicalType::BOOLEAN : column_data.type;
+	if (result.type != expected_type || !result.positions.empty() || !result.values.empty()) {
+		throw InternalException("Invalid persistent update export target");
+	}
+	result.Validate(column_data.count);
+	auto read_lock = lock.GetSharedLock();
+	if (!root) {
+		return true;
+	}
+	for (idx_t vector_index = 0; vector_index < root->info.size(); vector_index++) {
+		auto &entry = root->info[vector_index];
+		if (!entry.IsSet()) {
+			continue;
+		}
+		auto pin = entry.Pin();
+		auto &info = UpdateInfo::Get(pin);
+		if (result.positions.size() + info.N > max_entries) {
+			return false;
+		}
+		for (idx_t i = 0; i < info.N; i++) {
+			result.positions.push_back(vector_index * STANDARD_VECTOR_SIZE + info.GetTuples()[i]);
+			switch (column_data.type.id()) {
+			case LogicalTypeId::INTEGER:
+				result.values.push_back(Value::INTEGER(info.GetData<int32_t>()[i]));
+				break;
+			case LogicalTypeId::BIGINT:
+				result.values.push_back(Value::BIGINT(info.GetData<int64_t>()[i]));
+				break;
+			case LogicalTypeId::VALIDITY:
+				result.values.push_back(Value::BOOLEAN(info.GetData<bool>()[i]));
+				break;
+			default:
+				throw InternalException("Unsupported persistent update export type");
+			}
+		}
+	}
+	result.Validate(column_data.count);
+	return true;
+}
+
+void UpdateSegment::RestoreCheckpointUpdates(const CheckpointUpdateData &snapshot) {
+	snapshot.Validate(column_data.count);
+	auto expected_type = column_data.type.id() == LogicalTypeId::VALIDITY ? LogicalType::BOOLEAN : column_data.type;
+	if (snapshot.type != expected_type) {
+		throw SerializationException("Persistent update type does not match the column");
+	}
+	auto write_lock = lock.GetExclusiveLock();
+	if (root) {
+		throw InternalException("Persistent update restoration requires an empty root");
+	}
+	lock_guard<mutex> stats_guard(stats_lock);
+	for (idx_t offset = 0; offset < snapshot.positions.size();) {
+		auto vector_index = snapshot.positions[offset] / STANDARD_VECTOR_SIZE;
+		auto end = offset + 1;
+		while (end < snapshot.positions.size() && snapshot.positions[end] / STANDARD_VECTOR_SIZE == vector_index) {
+			end++;
+		}
+		InitializeUpdateInfo(vector_index);
+		auto capacity = UpdateInfo::GetCompactCapacity(end - offset);
+		auto handle = root->allocator.Allocate(UpdateInfo::GetAllocSize(type_size, capacity));
+		auto &info = UpdateInfo::Get(handle);
+		info.segment = this;
+		// A restored root is never a transaction undo node or a WAL record.
+		info.table = nullptr;
+		info.row_group_start = 0;
+		info.column_index = column_data.column_index;
+		info.version_number = MAX_COMMIT_ID;
+		info.vector_index = vector_index;
+		info.N = NumericCast<sel_t>(end - offset);
+		info.max = NumericCast<sel_t>(capacity);
+		info.prev = UndoBufferPointer();
+		info.next = UndoBufferPointer();
+		for (idx_t i = offset; i < end; i++) {
+			auto entry_index = i - offset;
+			info.GetTuples()[entry_index] = NumericCast<sel_t>(snapshot.positions[i] % STANDARD_VECTOR_SIZE);
+			switch (column_data.type.id()) {
+			case LogicalTypeId::INTEGER: {
+				auto value = snapshot.values[i].GetValue<int32_t>();
+				info.GetData<int32_t>()[entry_index] = value;
+				stats.statistics.UpdateNumericStats(value);
+				stats.statistics.SetHasNoNullFast();
+				break;
+			}
+			case LogicalTypeId::BIGINT: {
+				auto value = snapshot.values[i].GetValue<int64_t>();
+				info.GetData<int64_t>()[entry_index] = value;
+				stats.statistics.UpdateNumericStats(value);
+				stats.statistics.SetHasNoNullFast();
+				break;
+			}
+			case LogicalTypeId::VALIDITY: {
+				auto value = snapshot.values[i].GetValue<bool>();
+				info.GetData<bool>()[entry_index] = value;
+				if (value) {
+					stats.statistics.SetHasNoNullFast();
+				} else {
+					stats.statistics.SetHasNullFast();
+				}
+				break;
+			}
+			default:
+				throw SerializationException("Unsupported persistent update restoration type");
+			}
+		}
+		info.Verify();
+		root->info[vector_index] = handle.GetBufferPointer();
+		offset = end;
+	}
+	has_uncheckpointed_updates = false;
 }
 
 bool UpdateSegment::HasUpdates(idx_t vector_index) const {

@@ -491,3 +491,17 @@ This regenerates:
 - `extension/extension_config.cmake` - Extension configuration
 - `scripts/format.py` - Code formatter
 - `scripts/generate_*.py` - Code generation scripts
+
+## Persistent Delta Documents
+
+This worktree uses three complementary documents:
+
+- `plan.md` is the implementation contract: scope, invariants, design decisions, test requirements, and acceptance boundaries. It is not a status log.
+- `实现文档.md` is the latest implementation snapshot. It records only the current code shape, current validation, known limits, and current next step. Rewrite it when the implementation changes; do not preserve superseded states there.
+- `实现历史.md` is append-only history for meaningful attempts, rejected approaches, failure causes, and evidence that remains useful for future work. Do not duplicate the full current status in it.
+
+When code changes, update `实现文档.md` in the same change. Add an entry to `实现历史.md` only when a design choice, failed attempt, or validation result is materially useful. Keep `plan.md` as the source of acceptance requirements; update it only when implementation evidence changes the agreed design.
+
+## Persistent Delta Commit Policy
+
+Keep the persistent delta patch as a single commit on top of its `origin/main` base. When committing further changes, amend the existing patch commit instead of adding another commit. When remote publication is authorized, update `origin/persistent_delta` with an explicit `--force-with-lease` against its verified previous commit.

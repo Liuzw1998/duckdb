@@ -6,8 +6,166 @@
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/storage_compatibility.hpp"
 
 namespace duckdb {
+
+namespace {
+
+struct MarkModifiedBlockIds : public BlockIdVisitor {
+	void Visit(block_id_t block_id) override {
+		block_manager->MarkBlockAsModified(block_id);
+	}
+
+	BlockManager *block_manager = nullptr;
+};
+
+struct AuxiliaryCheckpointResult {
+	shared_ptr<ColumnData> column;
+	optional<PersistentColumnData> descriptor;
+};
+
+static vector<Value> ReadPersistentDeltaValues(ColumnData &column) {
+	vector<Value> result;
+	result.reserve(column.count);
+	for (idx_t offset = 0; offset < column.count; offset += STANDARD_VECTOR_SIZE) {
+		idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, column.count - offset);
+		Vector scan_vector(column.type);
+		ColumnScanState scan_state(nullptr);
+		column.ColumnData::InitializeScanWithOffset(scan_state, offset);
+		column.ColumnData::Scan(TransactionData(0, VisibilityBound::AllCommitted()), offset / STANDARD_VECTOR_SIZE,
+		                        scan_state, scan_vector, count);
+		FlatVector::SetSize(scan_vector, count);
+		scan_vector.Flatten();
+		for (idx_t i = 0; i < count; i++) {
+			if (!FlatVector::Validity(scan_vector).RowIsValid(i)) {
+				throw SerializationException("Persistent delta auxiliary columns cannot contain NULL values");
+			}
+			switch (column.type.id()) {
+			case LogicalTypeId::UBIGINT:
+				result.push_back(Value::UBIGINT(FlatVector::GetData<uint64_t>(scan_vector)[i]));
+				break;
+			case LogicalTypeId::INTEGER:
+				result.push_back(Value::INTEGER(FlatVector::GetData<int32_t>(scan_vector)[i]));
+				break;
+			case LogicalTypeId::BIGINT:
+				result.push_back(Value::BIGINT(FlatVector::GetData<int64_t>(scan_vector)[i]));
+				break;
+			case LogicalTypeId::BOOLEAN:
+				result.push_back(Value::BOOLEAN(FlatVector::GetData<bool>(scan_vector)[i]));
+				break;
+			default:
+				throw SerializationException("Unsupported persistent delta auxiliary type");
+			}
+		}
+	}
+	return result;
+}
+
+static PersistentColumnData MakePersistentBase(const LogicalType &type, ColumnData &value,
+                                               ValidityColumnData &validity) {
+	PersistentColumnData result(type, value.GetDataPointers());
+	result.child_columns.emplace_back(LogicalType(LogicalTypeId::VALIDITY), validity.GetDataPointers());
+	return result;
+}
+
+static AuxiliaryCheckpointResult CheckpointAuxiliaryColumn(StandardColumnData &owner, const RowGroup &row_group,
+                                                           ColumnCheckpointInfo &checkpoint_info,
+                                                           const LogicalType &type, const vector<Value> &values) {
+	if (values.empty()) {
+		return AuxiliaryCheckpointResult();
+	}
+	auto source = ColumnData::CreateColumn(owner.GetBlockManager(), owner.GetTableInfo(), owner.column_index, type,
+	                                       ColumnDataType::TRANSACTION_LOCAL);
+	checkpoint_info.GetPartialBlockManager().RegisterCheckpointColumnOwner(source);
+	ColumnAppendState append_state;
+	source->InitializeAppend(append_state);
+	Vector append_vector(type, values.size());
+	for (idx_t i = 0; i < values.size(); i++) {
+		if (values[i].IsNull()) {
+			throw SerializationException("Persistent delta auxiliary columns cannot contain NULL values");
+		}
+		append_vector.SetValue(i, values[i]);
+	}
+	source->Append(append_state, append_vector, values.size());
+	source->FinalizeAppend(nullptr, append_state);
+	auto state = source->Checkpoint(row_group, checkpoint_info);
+	AuxiliaryCheckpointResult result;
+	result.column = state->GetFinalResult();
+	result.descriptor = state->ToPersistentData();
+	return result;
+}
+
+static optional<PersistentColumnData> SerializeAuxiliaryColumn(const shared_ptr<ColumnData> &column) {
+	if (!column) {
+		return nullopt;
+	}
+	auto result = column->Serialize();
+	if (result.persistent_updates) {
+		throw InternalException("Persistent delta auxiliary columns cannot contain nested persistent updates");
+	}
+	return result;
+}
+
+static bool SupportsPersistentDeltaFormat(const StandardColumnData &column) {
+	if (column.HasParent()) {
+		return false;
+	}
+	if (column.type.id() != LogicalTypeId::INTEGER && column.type.id() != LogicalTypeId::BIGINT) {
+		return false;
+	}
+	return !StorageManager::IsPriorToVersion(StorageVersion::V2_1_0, column.GetStorageManager().GetStorageVersion());
+}
+
+static bool SupportsPersistentDelta(const StandardColumnData &column, const ColumnCheckpointInfo &info) {
+	if (!SupportsPersistentDeltaFormat(column)) {
+		return false;
+	}
+	if (info.GetCheckpointType() != CheckpointType::FULL_CHECKPOINT ||
+	    info.GetPartialBlockType() != PartialBlockType::FULL_CHECKPOINT ||
+	    info.GetVisibilityBound() == VisibilityBound::IncludingUncommitted()) {
+		return false;
+	}
+	return true;
+}
+
+static bool HasReliableBaseSize(ColumnData &column, idx_t &total_size) {
+	if (!column.IsPersistent()) {
+		return false;
+	}
+	total_size = 0;
+	for (auto &pointer : column.GetDataPointers()) {
+		if (!pointer.byte_size.has_value()) {
+			return false;
+		}
+		total_size += *pointer.byte_size;
+	}
+	return total_size != 0;
+}
+
+static bool TryPreparePersistentDelta(StandardColumnData &column, CheckpointUpdateData &value_updates,
+                                      CheckpointUpdateData &validity_updates) {
+	idx_t value_size;
+	idx_t validity_size;
+	if (!HasReliableBaseSize(column, value_size) || !HasReliableBaseSize(column.GetValidityData(), validity_size)) {
+		return false;
+	}
+	idx_t max_entries = MinValue<idx_t>(column.count / 100, 2048);
+	if (max_entries == 0 || !column.ExportCheckpointUpdates(value_updates, max_entries) ||
+	    !column.GetValidityData().ExportCheckpointUpdates(validity_updates, max_entries)) {
+		return false;
+	}
+	if (value_updates.positions.size() + validity_updates.positions.size() > max_entries) {
+		return false;
+	}
+	if ((value_updates.positions.size() + validity_updates.positions.size()) * 32 > (value_size + validity_size) / 4) {
+		return false;
+	}
+	return !value_updates.positions.empty() || !validity_updates.positions.empty();
+}
+
+} // namespace
 
 StandardColumnData::StandardColumnData(BlockManager &block_manager, DataTableInfo &info, idx_t column_index,
                                        LogicalType type, ColumnDataType data_type, optional_ptr<ColumnData> parent)
@@ -222,6 +380,53 @@ void StandardColumnData::FetchRows(TransactionData transaction, ColumnFetchState
 void StandardColumnData::VisitBlockIds(BlockIdVisitor &visitor) const {
 	ColumnData::VisitBlockIds(visitor);
 	validity->VisitBlockIds(visitor);
+	if (persistent_updates) {
+		if (persistent_updates->value_positions) {
+			persistent_updates->value_positions->VisitBlockIds(visitor);
+		}
+		if (persistent_updates->value_data) {
+			persistent_updates->value_data->VisitBlockIds(visitor);
+		}
+		if (persistent_updates->validity_positions) {
+			persistent_updates->validity_positions->VisitBlockIds(visitor);
+		}
+		if (persistent_updates->validity_data) {
+			persistent_updates->validity_data->VisitBlockIds(visitor);
+		}
+	}
+}
+
+void StandardColumnData::VisitPersistentDeltaBlockIds(BlockIdVisitor &visitor) const {
+	if (persistent_update_snapshot) {
+		persistent_update_snapshot->VisitBlockIds(visitor);
+		return;
+	}
+	VisitPersistentValueDeltaBlockIds(visitor);
+	VisitPersistentValidityDeltaBlockIds(visitor);
+}
+
+void StandardColumnData::VisitPersistentValueDeltaBlockIds(BlockIdVisitor &visitor) const {
+	if (!persistent_updates) {
+		return;
+	}
+	if (persistent_updates->value_positions) {
+		persistent_updates->value_positions->VisitBlockIds(visitor);
+	}
+	if (persistent_updates->value_data) {
+		persistent_updates->value_data->VisitBlockIds(visitor);
+	}
+}
+
+void StandardColumnData::VisitPersistentValidityDeltaBlockIds(BlockIdVisitor &visitor) const {
+	if (!persistent_updates) {
+		return;
+	}
+	if (persistent_updates->validity_positions) {
+		persistent_updates->validity_positions->VisitBlockIds(visitor);
+	}
+	if (persistent_updates->validity_data) {
+		persistent_updates->validity_data->VisitBlockIds(visitor);
+	}
 }
 
 void StandardColumnData::SetValidityData(shared_ptr<ValidityColumnData> validity_p) {
@@ -255,8 +460,10 @@ public:
 	shared_ptr<ColumnData> GetFinalResult() override {
 		if (result_column) {
 			auto &column_data = result_column->Cast<StandardColumnData>();
-			auto validity_child = validity_state->GetFinalResult();
-			column_data.SetValidityData(shared_ptr_cast<ColumnData, ValidityColumnData>(std::move(validity_child)));
+			if (!column_data.HasValidityData()) {
+				auto validity_child = validity_state->GetFinalResult();
+				column_data.SetValidityData(shared_ptr_cast<ColumnData, ValidityColumnData>(std::move(validity_child)));
+			}
 		}
 		return ColumnCheckpointState::GetFinalResult();
 	}
@@ -270,6 +477,26 @@ public:
 	PersistentColumnData ToPersistentData() override {
 		auto data = ColumnCheckpointState::ToPersistentData();
 		data.child_columns.push_back(validity_state->ToPersistentData());
+		auto serialize_updates = [&](const shared_ptr<PersistentUpdateColumns> &source_updates) {
+			data.persistent_updates = make_uniq<PersistentUpdateData>();
+			data.persistent_updates->value_positions = SerializeAuxiliaryColumn(source_updates->value_positions);
+			data.persistent_updates->value_data = SerializeAuxiliaryColumn(source_updates->value_data);
+			data.persistent_updates->validity_positions = SerializeAuxiliaryColumn(source_updates->validity_positions);
+			data.persistent_updates->validity_data = SerializeAuxiliaryColumn(source_updates->validity_data);
+		};
+		if (result_column) {
+			auto &standard_source = result_column->Cast<StandardColumnData>();
+			if (auto snapshot = standard_source.TakePersistentUpdateSnapshot()) {
+				data.persistent_updates = std::move(snapshot);
+			} else if (auto &source_updates = standard_source.GetPersistentUpdateColumns()) {
+				serialize_updates(source_updates);
+			}
+		} else {
+			auto &standard_source = original_column.Cast<StandardColumnData>();
+			if (auto &source_updates = standard_source.GetPersistentUpdateColumns()) {
+				serialize_updates(source_updates);
+			}
+		}
 		return data;
 	}
 };
@@ -282,6 +509,110 @@ StandardColumnData::CreateCheckpointState(const RowGroup &row_group, PartialBloc
 unique_ptr<ColumnCheckpointState> StandardColumnData::Checkpoint(const RowGroup &row_group,
                                                                  ColumnCheckpointInfo &checkpoint_info,
                                                                  const BaseStatistics &stats) {
+	if (persistent_updates && !HasUncheckpointedChanges() && SupportsPersistentDeltaFormat(*this)) {
+		// Metadata may need to be rewritten while the complete clean snapshot remains reusable.
+		auto base_state = CreateCheckpointState(row_group, checkpoint_info.GetPartialBlockManager());
+		base_state->global_stats = GetStatistics();
+		base_state->data_pointers = GetDataPointers();
+		auto validity_state = validity->CreateCheckpointState(row_group, checkpoint_info.GetPartialBlockManager());
+		validity_state->global_stats = BaseStatistics::CreateEmpty(validity->type).ToUnique();
+		validity_state->data_pointers = validity->GetDataPointers();
+		base_state->Cast<StandardColumnCheckpointState>().validity_state = std::move(validity_state);
+		return base_state;
+	}
+
+	bool can_write_delta = SupportsPersistentDelta(*this, checkpoint_info);
+	if (can_write_delta && (HasUncheckpointedUpdates() || validity->HasUncheckpointedUpdates())) {
+		CheckpointUpdateData value_updates(type);
+		CheckpointUpdateData validity_updates(LogicalType::BOOLEAN);
+		can_write_delta = TryPreparePersistentDelta(*this, value_updates, validity_updates);
+		if (can_write_delta) {
+			vector<Value> value_positions;
+			vector<Value> validity_positions;
+			for (auto position : value_updates.positions) {
+				value_positions.push_back(Value::UBIGINT(position));
+			}
+			for (auto position : validity_updates.positions) {
+				validity_positions.push_back(Value::UBIGINT(position));
+			}
+			vector<Value> value_data = value_updates.values;
+			vector<Value> validity_data = validity_updates.values;
+			auto result_column = make_shared_ptr<StandardColumnData>(GetBlockManager(), GetTableInfo(), column_index,
+			                                                         type, ColumnDataType::TRANSACTION_LOCAL, nullptr);
+			auto base_data = MakePersistentBase(type, *this, *validity);
+			result_column->ColumnData::InitializeColumn(base_data);
+			result_column->RestoreCheckpointUpdates(value_updates);
+			result_column->GetValidityData().RestoreCheckpointUpdates(validity_updates);
+			if (auto update_stats = result_column->GetUpdateStatistics()) {
+				result_column->MergeStatistics(*update_stats);
+			}
+			auto runtime_updates = make_shared_ptr<PersistentUpdateColumns>();
+			AuxiliaryCheckpointResult value_positions_result;
+			AuxiliaryCheckpointResult value_data_result;
+			AuxiliaryCheckpointResult validity_positions_result;
+			AuxiliaryCheckpointResult validity_data_result;
+			if (persistent_updates && !HasUncheckpointedUpdates()) {
+				runtime_updates->value_positions = persistent_updates->value_positions;
+				runtime_updates->value_data = persistent_updates->value_data;
+			} else {
+				value_positions_result =
+				    CheckpointAuxiliaryColumn(*this, row_group, checkpoint_info, LogicalType::UBIGINT, value_positions);
+				value_data_result = CheckpointAuxiliaryColumn(*this, row_group, checkpoint_info, type, value_data);
+				runtime_updates->value_positions = std::move(value_positions_result.column);
+				runtime_updates->value_data = std::move(value_data_result.column);
+			}
+			if (persistent_updates && !validity->HasUncheckpointedUpdates()) {
+				runtime_updates->validity_positions = persistent_updates->validity_positions;
+				runtime_updates->validity_data = persistent_updates->validity_data;
+			} else {
+				validity_positions_result = CheckpointAuxiliaryColumn(*this, row_group, checkpoint_info,
+				                                                      LogicalType::UBIGINT, validity_positions);
+				validity_data_result =
+				    CheckpointAuxiliaryColumn(*this, row_group, checkpoint_info, LogicalType::BOOLEAN, validity_data);
+				runtime_updates->validity_positions = std::move(validity_positions_result.column);
+				runtime_updates->validity_data = std::move(validity_data_result.column);
+			}
+			result_column->SetPersistentUpdateColumns(runtime_updates);
+			auto persistent_update_snapshot = make_uniq<PersistentUpdateData>();
+			if (persistent_updates && !HasUncheckpointedUpdates()) {
+				persistent_update_snapshot->value_positions =
+				    SerializeAuxiliaryColumn(runtime_updates->value_positions);
+				persistent_update_snapshot->value_data = SerializeAuxiliaryColumn(runtime_updates->value_data);
+			} else {
+				persistent_update_snapshot->value_positions = std::move(value_positions_result.descriptor);
+				persistent_update_snapshot->value_data = std::move(value_data_result.descriptor);
+			}
+			if (persistent_updates && !validity->HasUncheckpointedUpdates()) {
+				persistent_update_snapshot->validity_positions =
+				    SerializeAuxiliaryColumn(runtime_updates->validity_positions);
+				persistent_update_snapshot->validity_data = SerializeAuxiliaryColumn(runtime_updates->validity_data);
+			} else {
+				persistent_update_snapshot->validity_positions = std::move(validity_positions_result.descriptor);
+				persistent_update_snapshot->validity_data = std::move(validity_data_result.descriptor);
+			}
+			persistent_update_snapshot->ValidateDescriptorTypes(type);
+			result_column->SetPersistentUpdateSnapshot(std::move(persistent_update_snapshot));
+			MarkModifiedBlockIds old_delta_blocks;
+			old_delta_blocks.block_manager = &GetBlockManager();
+			if (persistent_updates && HasUncheckpointedUpdates()) {
+				VisitPersistentValueDeltaBlockIds(old_delta_blocks);
+			}
+			if (persistent_updates && validity->HasUncheckpointedUpdates()) {
+				VisitPersistentValidityDeltaBlockIds(old_delta_blocks);
+			}
+
+			auto base_state = CreateCheckpointState(row_group, checkpoint_info.GetPartialBlockManager());
+			base_state->SetResultColumn(result_column);
+			base_state->global_stats = result_column->GetStatistics();
+			base_state->data_pointers = result_column->GetDataPointers();
+			auto validity_state = validity->CreateCheckpointState(row_group, checkpoint_info.GetPartialBlockManager());
+			validity_state->global_stats = BaseStatistics::CreateEmpty(validity->type).ToUnique();
+			validity_state->data_pointers = result_column->GetValidityData().GetDataPointers();
+			base_state->Cast<StandardColumnCheckpointState>().validity_state = std::move(validity_state);
+			return base_state;
+		}
+	}
+
 	// we need to checkpoint the main column data first
 	// that is because the checkpointing of the main column data ALSO scans the validity data
 	// to prevent reading the validity data immediately after it is checkpointed we first checkpoint the main column
@@ -332,15 +663,112 @@ bool StandardColumnData::HasAnyChanges() const {
 	return ColumnData::HasAnyChanges() || validity->HasAnyChanges();
 }
 
+bool StandardColumnData::HasUncheckpointedChanges() const {
+	if (!persistent_updates) {
+		return HasAnyChanges();
+	}
+	for (auto &segment : data.SegmentNodes()) {
+		if (segment.GetNode().GetSegmentType() == ColumnSegmentType::TRANSIENT) {
+			return true;
+		}
+	}
+	for (auto &segment : validity->data.SegmentNodes()) {
+		if (segment.GetNode().GetSegmentType() == ColumnSegmentType::TRANSIENT) {
+			return true;
+		}
+	}
+	return HasUncheckpointedUpdates() || validity->HasUncheckpointedUpdates();
+}
+
 PersistentColumnData StandardColumnData::Serialize() {
-	auto persistent_data = ColumnData::Serialize();
-	persistent_data.child_columns.push_back(validity->Serialize());
+	if (!persistent_updates) {
+		auto persistent_data = ColumnData::Serialize();
+		persistent_data.child_columns.push_back(validity->Serialize());
+		return persistent_data;
+	}
+	auto persistent_data = PersistentColumnData(type, GetDataPointers());
+	persistent_data.has_updates = HasUncheckpointedUpdates() || validity->HasUncheckpointedUpdates();
+	persistent_data.child_columns.emplace_back(LogicalType(LogicalTypeId::VALIDITY), validity->GetDataPointers());
+	if (persistent_update_snapshot) {
+		persistent_data.persistent_updates = std::move(persistent_update_snapshot);
+	} else {
+		persistent_data.persistent_updates = make_uniq<PersistentUpdateData>();
+		persistent_data.persistent_updates->value_positions =
+		    SerializeAuxiliaryColumn(persistent_updates->value_positions);
+		persistent_data.persistent_updates->value_data = SerializeAuxiliaryColumn(persistent_updates->value_data);
+		persistent_data.persistent_updates->validity_positions =
+		    SerializeAuxiliaryColumn(persistent_updates->validity_positions);
+		persistent_data.persistent_updates->validity_data = SerializeAuxiliaryColumn(persistent_updates->validity_data);
+	}
 	return persistent_data;
 }
 
 void StandardColumnData::InitializeColumn(PersistentColumnData &column_data, BaseStatistics &target_stats) {
 	ColumnData::InitializeColumn(column_data, target_stats);
 	validity->InitializeColumn(column_data.child_columns[0], target_stats);
+	if (!column_data.persistent_updates) {
+		return;
+	}
+	column_data.persistent_updates->ValidateDescriptorTypes(type);
+	auto runtime_updates = make_shared_ptr<PersistentUpdateColumns>();
+	auto load = [&](optional<PersistentColumnData> &descriptor, const LogicalType &type) -> shared_ptr<ColumnData> {
+		if (!descriptor) {
+			return nullptr;
+		}
+		auto result = ColumnData::CreateColumn(GetBlockManager(), GetTableInfo(), column_index, type,
+		                                       ColumnDataType::TRANSACTION_LOCAL);
+		result->InitializeColumn(*descriptor);
+		return result;
+	};
+	runtime_updates->value_positions = load(column_data.persistent_updates->value_positions, LogicalType::UBIGINT);
+	runtime_updates->value_data = load(column_data.persistent_updates->value_data, type);
+	runtime_updates->validity_positions =
+	    load(column_data.persistent_updates->validity_positions, LogicalType::UBIGINT);
+	runtime_updates->validity_data = load(column_data.persistent_updates->validity_data, LogicalType::BOOLEAN);
+	if (runtime_updates->HasValueDelta()) {
+		auto positions = ReadPersistentDeltaValues(*runtime_updates->value_positions);
+		auto values = ReadPersistentDeltaValues(*runtime_updates->value_data);
+		if (positions.size() != values.size()) {
+			throw SerializationException("Persistent value delta streams have different lengths");
+		}
+		CheckpointUpdateData snapshot(type);
+		for (auto &position : positions) {
+			snapshot.positions.push_back(position.GetValue<uint64_t>());
+		}
+		snapshot.values = std::move(values);
+		snapshot.Validate(count);
+		RestoreCheckpointUpdates(snapshot);
+	}
+	if (runtime_updates->HasValidityDelta()) {
+		auto positions = ReadPersistentDeltaValues(*runtime_updates->validity_positions);
+		auto values = ReadPersistentDeltaValues(*runtime_updates->validity_data);
+		if (positions.size() != values.size()) {
+			throw SerializationException("Persistent validity delta streams have different lengths");
+		}
+		CheckpointUpdateData snapshot(LogicalType::BOOLEAN);
+		for (auto &position : positions) {
+			snapshot.positions.push_back(position.GetValue<uint64_t>());
+		}
+		snapshot.values = std::move(values);
+		snapshot.Validate(count);
+		validity->RestoreCheckpointUpdates(snapshot);
+	}
+	persistent_updates = std::move(runtime_updates);
+	if (auto update_stats = GetUpdateStatistics()) {
+		MergeStatistics(*update_stats);
+	}
+}
+
+void StandardColumnData::SetPersistentUpdateColumns(shared_ptr<PersistentUpdateColumns> updates) {
+	persistent_updates = std::move(updates);
+}
+
+void StandardColumnData::SetPersistentUpdateSnapshot(unique_ptr<PersistentUpdateData> snapshot) {
+	persistent_update_snapshot = std::move(snapshot);
+}
+
+unique_ptr<PersistentUpdateData> StandardColumnData::TakePersistentUpdateSnapshot() {
+	return std::move(persistent_update_snapshot);
 }
 
 void StandardColumnData::GetColumnSegmentInfo(const QueryContext &context, duckdb::idx_t row_group_index,
