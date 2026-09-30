@@ -12,6 +12,7 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/execution/adaptive_filter.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/index/art/iterator.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -36,6 +37,9 @@
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/parallel/scan_read_ahead.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
@@ -131,6 +135,139 @@ public:
 	}
 };
 
+// A point fetch through these codecs is materially more expensive than a vectorized scan. Keep the guard
+// deliberately conservative: it is only used for the newly admitted multi-filter index path.
+static constexpr double CODEC_ADMISSION_DICT_FSST_FACTOR = 1.0 / 32.0;
+static constexpr double CODEC_ADMISSION_ZSTD_FACTOR = 1.0 / 32.0;
+
+static double CodecAdmissionFactor(const CompressionType compression) {
+	switch (compression) {
+	case CompressionType::COMPRESSION_DICT_FSST:
+		return CODEC_ADMISSION_DICT_FSST_FACTOR;
+	case CompressionType::COMPRESSION_ZSTD:
+		return CODEC_ADMISSION_ZSTD_FACTOR;
+	default:
+		return 1.0;
+	}
+}
+
+static idx_t CodecAdmissionMaxCount(const idx_t max_count, const double factor) {
+	return MaxValue<idx_t>(LossyNumericCast<idx_t>(static_cast<double>(max_count) * factor), 1);
+}
+
+static bool IsUnsupportedCodecAdmissionColumn(const ColumnList &column_list, const ColumnIndex &column_index) {
+	if (!column_index.HasPrimaryIndex() || column_index.IsVirtualColumn() || column_index.IsRowIdColumn() ||
+	    column_index.IsRowNumberColumn() || column_index.IsEmptyColumn() || column_index.HasChildren() ||
+	    column_index.IsPushdownExtract()) {
+		return true;
+	}
+	const auto &column_type = column_list.GetColumn(column_index.ToLogical()).Type();
+	return column_type.IsNested() || column_type.id() == LogicalTypeId::GEOMETRY;
+}
+
+//! Inspect only the scalar segments touched by the sorted ART row IDs and the columns that this Fetch will read.
+//! Unsupported projections are skipped so a safe scalar column can still reject an expensive ART candidate.
+static bool PassesCodecAdmission(DuckTableEntry &table, DataTable &storage, const vector<ColumnIndex> &column_indexes,
+                                 const unsafe_vector<row_t> &row_ids, const idx_t max_count) {
+	if (row_ids.empty()) {
+		return true;
+	}
+
+	const auto dict_fsst_max_count = CodecAdmissionMaxCount(max_count, CODEC_ADMISSION_DICT_FSST_FACTOR);
+	const auto zstd_max_count = CodecAdmissionMaxCount(max_count, CODEC_ADMISSION_ZSTD_FACTOR);
+	const auto minimum_codec_max_count = MinValue(dict_fsst_max_count, zstd_max_count);
+	if (row_ids.size() <= minimum_codec_max_count) {
+		return true;
+	}
+
+	vector<StorageIndex> column_ids;
+	column_ids.reserve(column_indexes.size());
+	const auto &column_list = table.GetColumns();
+	for (const auto &column_index : column_indexes) {
+		if (IsUnsupportedCodecAdmissionColumn(column_list, column_index)) {
+			continue;
+		}
+		const auto &column_type = column_list.GetColumn(column_index.ToLogical()).Type();
+		if (column_type.InternalType() != PhysicalType::VARCHAR) {
+			continue;
+		}
+		auto storage_index = table.GetStorageIndex(column_index);
+		if (!storage_index.HasPrimaryIndex() || storage_index.IsRowIdColumn() || storage_index.IsRowNumberColumn() ||
+		    storage_index.HasChildren() || storage_index.IsPushdownExtract()) {
+			continue;
+		}
+		column_ids.emplace_back(std::move(storage_index));
+	}
+	if (column_ids.empty()) {
+		return true;
+	}
+
+	const auto row_groups = storage.GetRowGroupCollection();
+	if (!row_groups) {
+		return true;
+	}
+	const auto row_group_tree = row_groups->GetRowGroups();
+	if (!row_group_tree) {
+		return true;
+	}
+
+	for (const auto &column_id : column_ids) {
+		optional_ptr<SegmentNode<RowGroup>> current_row_group;
+		optional_ptr<ColumnData> current_column;
+		optional_ptr<SegmentNode<ColumnSegment>> current_segment;
+		SegmentLock column_lock;
+		double factor = 1.0;
+
+		for (const auto row_id : row_ids) {
+			if (row_id < 0) {
+				return true;
+			}
+			if (!current_row_group || row_id < NumericCast<row_t>(current_row_group->GetRowStart()) ||
+			    row_id >= NumericCast<row_t>(current_row_group->GetRowEnd())) {
+				current_segment = nullptr;
+				current_column = nullptr;
+				column_lock = SegmentLock();
+				{
+					auto row_group_lock = row_group_tree->Lock();
+					idx_t row_group_index;
+					if (!row_group_tree->TryGetSegmentIndex(row_group_lock, NumericCast<idx_t>(row_id),
+					                                        row_group_index)) {
+						return true;
+					}
+					current_row_group =
+					    row_group_tree->GetSegmentByIndex(row_group_lock, NumericCast<int64_t>(row_group_index));
+				}
+				if (!current_row_group) {
+					return true;
+				}
+				current_column = &current_row_group->GetNode().GetRawColumnData(column_id);
+				column_lock = current_column->GetSegmentTree().Lock();
+			}
+
+			const auto column_offset = NumericCast<idx_t>(row_id) - current_row_group->GetRowStart();
+			if (!current_segment || column_offset < current_segment->GetRowStart() ||
+			    column_offset >= current_segment->GetRowEnd()) {
+				idx_t segment_index;
+				if (!current_column->GetSegmentTree().TryGetSegmentIndex(column_lock, column_offset, segment_index)) {
+					return true;
+				}
+				current_segment = current_column->GetSegmentTree().GetSegmentByIndex(
+				    column_lock, NumericCast<int64_t>(segment_index));
+				if (!current_segment) {
+					return true;
+				}
+				factor =
+				    MinValue(factor, CodecAdmissionFactor(current_segment->GetNode().GetCompressionFunction().type));
+				const auto effective_max_count = CodecAdmissionMaxCount(max_count, factor);
+				if (row_ids.size() > effective_max_count) {
+					return false;
+				}
+			}
+		}
+	}
+	return true;
+}
+
 class DuckIndexScanState : public TableScanGlobalState {
 public:
 	DuckIndexScanState(ClientContext &context, const FunctionData *bind_data_p, unsafe_vector<row_t> &&row_ids_p)
@@ -152,6 +289,9 @@ public:
 	mutex index_scan_lock;
 	//! Keep ART rowids and row-group trees paired while rowid-shifting index vacuum can run.
 	unique_ptr<StorageLockKey> vacuum_lock;
+	//! Preserve the existing single-filter path. Multi-filter scans recheck all filters instead of tracking which
+	//! predicates the ART consumed.
+	bool filter_fetched_rows = false;
 
 public:
 	unique_ptr<LocalTableFunctionState> InitLocalState(ExecutionContext &context,
@@ -225,12 +365,17 @@ public:
 				auto row_id_data = reinterpret_cast<data_ptr_t>(row_ids.data() + offset);
 				Vector local_vector(LogicalType::ROW_TYPE, row_id_data, scan_count);
 
-				if (CanRemoveFilterColumns()) {
+				const auto remove_filter_columns = CanRemoveFilterColumns();
+				auto &fetch_chunk = remove_filter_columns ? l_state.all_columns : output;
+				if (remove_filter_columns) {
 					l_state.all_columns.Reset();
-					storage.Fetch(tx, l_state.all_columns, column_ids, local_vector, scan_count, l_state.fetch_state);
-					output.ReferenceColumns(l_state.all_columns, projection_ids);
-				} else {
-					storage.Fetch(tx, output, column_ids, local_vector, scan_count, l_state.fetch_state);
+				}
+				storage.Fetch(tx, fetch_chunk, column_ids, local_vector, scan_count, l_state.fetch_state);
+				if (filter_fetched_rows) {
+					ApplyFilters(l_state.scan_state.GetFilterInfo(), fetch_chunk);
+				}
+				if (remove_filter_columns) {
+					output.ReferenceColumns(fetch_chunk, projection_ids);
 				}
 
 				l_state.rows_scanned += scan_count;
@@ -263,6 +408,39 @@ public:
 				return;
 			}
 			}
+		}
+	}
+
+	//! Apply all single-column table filters to one fetched chunk.
+	static void ApplyFilters(ScanFilterInfo &filter_info, DataChunk &chunk) {
+		if (chunk.size() == 0) {
+			return;
+		}
+
+		auto &filter_list = filter_info.GetFilterList();
+		const auto &permutation = filter_info.GetAdaptiveFilter()->GetPermutation();
+		auto filter_state = filter_info.BeginFilter();
+		SelectionVector sel;
+		const auto scan_count = chunk.size();
+		idx_t approved_tuple_count = scan_count;
+		for (idx_t i = 0; i < filter_list.size(); i++) {
+			if (approved_tuple_count == 0) {
+				break;
+			}
+			// Ignore row-group-specific always_true markers from local storage; persistent candidates need every
+			// filter.
+			auto &filter = filter_list[permutation[i]];
+			const auto scan_idx = filter.scan_column_index.GetIndex();
+			D_ASSERT(scan_idx < chunk.ColumnCount());
+			ColumnSegment::FilterSelection(sel, chunk.data[scan_idx], *filter.filter_state, scan_count,
+			                               approved_tuple_count);
+		}
+		filter_info.EndFilter(filter_state);
+
+		if (approved_tuple_count == 0) {
+			chunk.Reset();
+		} else if (approved_tuple_count < scan_count) {
+			chunk.Slice(sel, approved_tuple_count);
 		}
 	}
 
@@ -654,6 +832,7 @@ unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &cont
                                                              unique_ptr<StorageLockKey> vacuum_lock) {
 	auto g_state = make_uniq<DuckIndexScanState>(context, input.bind_data.get(), std::move(row_ids));
 	g_state->vacuum_lock = std::move(vacuum_lock);
+	g_state->filter_fetched_rows = input.filters->FilterCount() > 1;
 
 	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
 	if (input.CanRemoveFilterColumns()) {
@@ -849,7 +1028,6 @@ bool TryScanIndex(const IndexReadHandle<ART> &art, const ColumnList &column_list
                   TableFilterSet &filter_set, RowIdVectorOutput &row_ids) {
 	row_ids.Reset();
 	// FIXME: No support for index scans on compound ARTs.
-	// See note above on multi-filter support.
 	if (art->UnboundExpressionCount() > 1) {
 		return false;
 	}
@@ -857,7 +1035,7 @@ bool TryScanIndex(const IndexReadHandle<ART> &art, const ColumnList &column_list
 	auto index_expr = art->CopyUnboundExpression(0);
 	auto indexed_columns = art->GetColumnIds();
 
-	// NOTE: We do not push down multi-column filters, e.g., 42 = a + b.
+	// Only single-column indexes can drive the lookup.
 	if (indexed_columns.size() != 1) {
 		return false;
 	}
@@ -930,13 +1108,8 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 
 	auto &filter_set = *input.filters;
 
-	// FIXME: We currently only support scanning one ART with one filter.
-	// If multiple filters exist, i.e., a = 11 AND b = 24, we need to
-	// 1.	1.1. Find + scan one ART for a = 11.
-	//		1.2. Find + scan one ART for b = 24.
-	//		1.3. Return the intersecting row IDs.
-	// 2. (Reorder and) scan a single ART with a compound key of (a, b).
-	if (filter_set.FilterCount() != 1) {
+	// Multi-column filters only prune row groups; their full expressions remain above the scan.
+	if (filter_set.FilterCount() == 0) {
 		return DuckTableScanInitGlobal(context, input, storage, bind_data);
 	}
 
@@ -956,6 +1129,7 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 	auto &column_list = duck_table.GetColumns();
 	bool index_scan = false;
 	RowIdVectorOutput row_ids(max_count);
+	const bool multi_filter_scan = filter_set.FilterCount() > 1;
 
 	info->BindIndexes(context, ART::TYPE_NAME);
 
@@ -978,15 +1152,20 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 			index_scan = TryScanIndex(index, column_list, input, filter_set, row_ids);
 		}
 		if (index_scan) {
-			// found an index - break
-			break;
+			auto candidate_rows = row_ids.TakeRows();
+			if (multi_filter_scan &&
+			    !PassesCodecAdmission(duck_table, storage, input.column_indexes, candidate_rows, max_count)) {
+				// This ART would use too many point fetches for the actual columns and segments. Try the next ART.
+				index_scan = false;
+				row_ids.Reset();
+				continue;
+			}
+			return DuckIndexScanInitGlobal(context, input, bind_data, std::move(candidate_rows),
+			                               std::move(vacuum_lock));
 		}
 	}
 
-	if (!index_scan) {
-		return DuckTableScanInitGlobal(context, input, storage, bind_data);
-	}
-	return DuckIndexScanInitGlobal(context, input, bind_data, row_ids.TakeRows(), std::move(vacuum_lock));
+	return DuckTableScanInitGlobal(context, input, storage, bind_data);
 }
 
 static unique_ptr<BaseStatistics> TableScanStatistics(ClientContext &context, TableFunctionGetStatisticsInput &input) {

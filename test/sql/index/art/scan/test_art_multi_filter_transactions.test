@@ -1,0 +1,176 @@
+# name: test/sql/index/art/scan/test_art_multi_filter_transactions.test
+# description: Multiple-filter ART lookups preserve local rows, visibility, updates and persistence.
+# group: [scan]
+
+load {TEST_DIR}/art_multi_filter_transactions.db
+
+statement ok
+CREATE TABLE t(k INTEGER, status INTEGER, payload INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1, 0, 10), (1, 1, 11), (2, 0, 20), (3, 1, 31), (8, 1, 81)
+
+statement ok
+CREATE INDEX t_key ON t(k)
+
+statement ok
+CHECKPOINT
+
+statement ok
+BEGIN
+
+# All local rows have status=1. Their zonemap must not suppress the persistent status filter.
+statement ok
+INSERT INTO t VALUES (1, 1, 12), (9, 1, 91)
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I rowsort
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+11
+12
+
+# No persistent ART candidates, but a local row still matches.
+query I
+SELECT payload FROM t WHERE k = 9 AND status = 1
+----
+91
+
+statement ok
+DELETE FROM t WHERE payload = 11
+
+# Fetch packs out a deleted candidate before residual filtering.
+query I
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+12
+
+statement ok
+UPDATE t SET status = 1 WHERE payload = 10
+
+query I rowsort
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+10
+12
+
+statement ok
+UPDATE t SET k = 4 WHERE payload = 20
+
+query I
+SELECT payload FROM t WHERE k = 4 AND status = 0
+----
+20
+
+statement ok
+ROLLBACK
+
+query I
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+11
+
+# DML keeps the residual predicate when selecting rows for a write. The current UPDATE/DELETE
+# planner path is covered for correctness here; EXPLAIN ANALYZE remains a sequential scan today.
+statement ok
+BEGIN
+
+query I
+UPDATE t SET payload = payload + 100 WHERE k = 1 AND status = 1 RETURNING payload
+----
+111
+
+query I
+DELETE FROM t WHERE k = 1 AND status = 0 RETURNING payload
+----
+10
+
+query I
+SELECT payload FROM t WHERE k = 1
+----
+111
+
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT payload FROM t WHERE k = 1
+----
+10
+11
+
+statement ok reader
+BEGIN
+
+query I reader
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+11
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE t SET status = 1 WHERE payload = 10
+
+statement ok
+DELETE FROM t WHERE payload = 11
+
+statement ok
+UPDATE t SET k = 7 WHERE payload = 31
+
+statement ok
+INSERT INTO t VALUES (1, 1, 12)
+
+statement ok
+COMMIT
+
+# The old snapshot still sees the deleted row and the old residual/index values.
+query I reader
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+11
+
+query I reader
+SELECT payload FROM t WHERE k = 3 AND status = 1
+----
+31
+
+query I rowsort
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+10
+12
+
+query I
+SELECT payload FROM t WHERE k = 7 AND status = 1
+----
+31
+
+statement ok reader
+ROLLBACK
+
+statement ok
+CHECKPOINT
+
+restart
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I rowsort
+SELECT payload FROM t WHERE k = 1 AND status = 1
+----
+10
+12
+
+query I
+SELECT payload FROM t WHERE k = 7 AND status = 1
+----
+31
