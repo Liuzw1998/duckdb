@@ -1,0 +1,20 @@
+diff --git a/third_party/avro-c/lang/c/src/datafile.c b/third_party/avro-c/lang/c/src/datafile.c
+--- a/third_party/avro-c/lang/c/src/datafile.c
++++ b/third_party/avro-c/lang/c/src/datafile.c
+@@ -100,6 +100,7 @@ static int write_header(avro_file_writer_t w, const char *metadata_json)
+ {
+ 	int rval;
++	char magic[] = "Obj";
+ 	uint8_t version = 1;
+ 	/* TODO: remove this static buffer */
+ 	avro_writer_t schema_writer;
+ 	const avro_encoding_t *enc = &avro_binary_encoding;
+@@ -108,7 +109,7 @@ static int write_header(avro_file_writer_t w, const char *metadata_json)
+ 	/* Generate random sync */
+ 	generate_sync(w);
+ 
+-	check(rval, avro_write(w->writer, "Obj", 3));
++	check(rval, avro_write(w->writer, magic, 3));
+ 	check(rval, avro_write(w->writer, &version, 1));
+ 
+ 	json_t *metadata_obj = NULL;

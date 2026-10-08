@@ -1,0 +1,123 @@
+# name: test/sql/index/art/scan/test_art_multi_filter_batches.test
+# description: Multiple-filter ART batch boundaries, execution modes and candidate limits.
+# group: [scan]
+
+require vector_size 2048
+
+statement ok
+CREATE TABLE batches AS
+SELECT i AS id, CASE WHEN i < 6000 THEN 1 ELSE 2 END AS lookup_key,
+       CASE WHEN i < 4096 THEN 0 WHEN i < 6000 THEN 1 ELSE 2 END AS status
+FROM range(10000) t(i)
+
+statement ok
+CREATE INDEX batches_lookup ON batches(lookup_key)
+
+# Only this correctness test raises the threshold to exercise several fetched batches.
+statement ok
+SET index_scan_percentage = 0
+
+statement ok
+SET index_scan_max_count = 6000
+
+# Force the small table to expose the parallel scan scheduling path.
+statement ok
+PRAGMA verify_parallelism
+
+foreach mode SYNCHRONOUS TASK_EXECUTOR
+
+statement ok
+SET debug_physical_table_scan_execution_strategy = '{mode}'
+
+foreach threads 1 4
+
+statement ok
+SET threads = {threads}
+
+# Two empty batches must not terminate the source before the third batch.
+query II
+EXPLAIN ANALYZE SELECT id FROM batches WHERE lookup_key = 1 AND status = 1
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query III
+SELECT count(*), min(id), max(id) FROM batches WHERE lookup_key = 1 AND status = 1
+----
+1904	4096	5999
+
+query I
+SELECT count(*) FROM batches WHERE lookup_key = 1 AND status = 2
+----
+0
+
+query I
+SELECT count(*) FROM batches WHERE lookup_key = 1 AND status <> 2
+----
+6000
+
+endloop
+
+endloop
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+# The limit applies to candidates, even when only one row survives the residual filter.
+statement ok
+SET index_scan_max_count = 5999
+
+query II
+EXPLAIN ANALYZE SELECT id FROM batches WHERE lookup_key = 1 AND id = 5999
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT id FROM batches WHERE lookup_key = 1 AND id = 5999
+----
+5999
+
+statement ok
+SET index_scan_max_count = 6000
+
+query II
+EXPLAIN ANALYZE SELECT id FROM batches WHERE lookup_key = 1 AND id = 5999
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+# Skip an unsupported index and reset an over-capacity probe before trying a later ART.
+statement ok
+CREATE TABLE candidates AS SELECT i AS id, i % 2 AS broad_key, i % 3 AS residual FROM range(10000) t(i)
+
+statement ok
+CREATE INDEX candidate_expression ON candidates ((id + 1))
+
+statement ok
+CREATE INDEX candidate_broad ON candidates(broad_key)
+
+statement ok
+CREATE INDEX candidate_id ON candidates(id)
+
+statement ok
+SET index_scan_max_count = 10
+
+query II
+EXPLAIN ANALYZE SELECT id FROM candidates WHERE broad_key = 0 AND id = 42 AND residual = 0
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT id FROM candidates WHERE broad_key = 0 AND id = 42 AND residual = 0
+----
+42
+
+# Compound indexes remain ineligible.
+statement ok
+CREATE TABLE compound AS SELECT * FROM candidates
+
+statement ok
+CREATE INDEX compound_index ON compound(id, broad_key)
+
+query II
+EXPLAIN ANALYZE SELECT id FROM compound WHERE id = 42 AND broad_key = 0
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*

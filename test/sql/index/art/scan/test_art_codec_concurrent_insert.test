@@ -1,0 +1,67 @@
+# name: test/sql/index/art/scan/test_art_codec_concurrent_insert.test
+# description: Multi-filter ART admission across reopened row groups permits concurrent appends.
+# group: [scan]
+
+load {TEST_DIR}/codec_concurrent.db readwrite v2.0.0
+
+statement ok
+ATTACH '{TEMP_DIR}/codec_concurrent_rows.db' AS cold (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+statement ok
+PRAGMA force_compression = 'uncompressed'
+
+statement ok
+CREATE TABLE cold.t AS
+SELECT CASE WHEN i % 64 = 0 THEN 42 ELSE i + 1000 END AS lookup_key,
+       (i = 0)::INTEGER AS residual, repeat('p', 256) AS payload
+FROM range(8192) r(i)
+
+statement ok
+CREATE INDEX lookup_idx ON cold.t(lookup_key)
+
+statement ok
+CHECKPOINT cold
+
+query I
+SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('cold.t')
+----
+4
+
+restart
+
+statement ok
+ATTACH '{TEMP_DIR}/codec_concurrent_rows.db' AS cold (ROW_GROUP_SIZE 2048, STORAGE_VERSION 'v2.0.0')
+
+concurrentloop worker 0 2
+
+statement ok
+SET index_scan_percentage = 0
+
+statement ok
+SET index_scan_max_count = 2048
+
+loop i 0 20
+
+onlyif worker=0
+statement ok
+INSERT INTO cold.t VALUES (100000 + {i}, 0, repeat('q', 256))
+
+skipif worker=0
+query I
+SELECT length(payload) FROM cold.t WHERE lookup_key = 42 AND residual = 1
+----
+256
+
+endloop
+
+endloop
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM cold.t WHERE lookup_key = 42 AND residual = 1
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+SELECT count(*), count(*) FILTER (WHERE lookup_key = 42) FROM cold.t
+----
+8212	128

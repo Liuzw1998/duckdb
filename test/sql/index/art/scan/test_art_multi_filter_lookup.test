@@ -1,0 +1,168 @@
+# name: test/sql/index/art/scan/test_art_multi_filter_lookup.test
+# description: Fetch candidates from one ART and filter the complete scan input before projection.
+# group: [scan]
+
+# Default index thresholds. The generated column separates logical and physical column indexes.
+statement ok
+CREATE TABLE orders(payload VARCHAR, doubled BIGINT AS (id * 2), id BIGINT PRIMARY KEY,
+                    tenant_id INTEGER, status VARCHAR, amount INTEGER, lookup_key INTEGER,
+                    details STRUCT(region VARCHAR, score INTEGER), tags INTEGER[])
+
+statement ok
+INSERT INTO orders
+SELECT 'order-' || i, i, i % 7,
+       CASE WHEN i % 5 = 0 THEN NULL ELSE ['new', 'ready', 'closed'][i % 3 + 1] END,
+       i % 100, i % 1000,
+       {'region': CASE WHEN i % 2 = 0 THEN 'east' ELSE 'west' END, 'score': i % 100}, [i, i + 1]
+FROM range(20000) t(i)
+
+statement ok
+CREATE INDEX orders_lookup ON orders(lookup_key)
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM orders WHERE id = 42 AND tenant_id = 0 AND status = 'new'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query T
+SELECT payload FROM orders WHERE id = 42 AND tenant_id = 0 AND status = 'new'
+----
+order-42
+
+query T
+SELECT payload FROM orders WHERE id = 42 AND tenant_id = 1 AND status = 'new'
+----
+
+# Non-contiguous IN, a duplicate key, a missing key and a filter-only column.
+query II
+EXPLAIN ANALYZE SELECT id, payload FROM orders WHERE id IN (2, 5, 9, 17, 42, 42, 20001) AND status = 'closed'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query IT
+SELECT id, payload FROM orders WHERE id IN (2, 5, 9, 17, 42, 42, 20001) AND status = 'closed' ORDER BY id
+----
+2	order-2
+17	order-17
+
+# All, some and no candidates survive; count(*) also exercises filter column pruning.
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND amount > 0
+----
+3
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND amount > 40
+----
+1
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND amount > 90
+----
+0
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM orders WHERE lookup_key = 42 AND status = 'new' AND amount > 40
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM orders WHERE lookup_key = 42 AND status = 'new' AND amount > 40
+----
+7
+
+# Reordered outputs, rowid, and a generated column all use the original scan input mapping.
+query TIII
+SELECT status, doubled, rowid, id FROM orders WHERE id = 42 AND tenant_id = 0
+----
+new	84	42	42
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND rowid > 10
+----
+2
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM orders WHERE id = 42 AND details.region = 'east'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query T
+SELECT payload FROM orders WHERE id = 42 AND details.region = 'east'
+----
+order-42
+
+query T
+SELECT payload FROM orders WHERE id = 42 AND details.region = 'west'
+----
+
+query T
+SELECT payload FROM orders WHERE id = 42 AND list_contains(tags, 43)
+----
+order-42
+
+query T
+SELECT payload FROM orders WHERE id IN (42, 43) AND CAST(amount AS VARCHAR) = '42'
+----
+order-42
+
+# Multiple predicates on the same residual column share one filter state.
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND amount > 10 AND amount < 40
+----
+1
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 5, 10, 17) AND status IS NULL
+----
+2
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 5, 10, 17) AND status IS NOT NULL
+----
+2
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 5, 10, 17) AND status NOT IN ('ready', NULL)
+----
+0
+
+# A multi-column expression is still evaluated above the scan.
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND amount > 0 AND tenant_id + amount > 40
+----
+1
+
+# One single-column ART filter plus an upper multi-column residual expression.
+query II
+EXPLAIN ANALYZE SELECT payload FROM orders WHERE id IN (2, 17, 42) AND tenant_id + amount > 40
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM orders WHERE id IN (2, 17, 42) AND tenant_id + amount > 40
+----
+1
+
+# Existing single-filter ART and no suitable index.
+query II
+EXPLAIN ANALYZE SELECT payload FROM orders WHERE id = 42
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM orders WHERE tenant_id = 0 AND status = 'new'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+# Compare with the same query using the table scan.
+statement ok
+SET index_scan_max_count = 0
+
+statement ok
+SET index_scan_percentage = 0
+
+query I
+SELECT count(*) FROM orders WHERE lookup_key = 42 AND status = 'new' AND amount > 40
+----
+7

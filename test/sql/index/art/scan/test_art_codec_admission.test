@@ -1,0 +1,483 @@
+# name: test/sql/index/art/scan/test_art_codec_admission.test
+# description: Codec-aware admission for multi-filter ART scans uses actual fetched segment codecs.
+# group: [scan]
+
+load {TEST_DIR}/codec_admission.db readwrite v2.0.0
+
+statement ok
+SET index_scan_percentage = 0
+
+statement ok
+SET index_scan_max_count = 2048
+
+# Verify the test data really stores the referenced payload in DICT_FSST.
+statement ok
+PRAGMA force_compression = 'dict_fsst'
+
+statement ok
+CREATE TABLE codec_guard(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_guard
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('w', 4096)
+FROM range(65) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('x', 4096)
+FROM range(9935) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_guard_lookup ON codec_guard(lookup_key)
+
+query I
+SELECT count(*) FROM pragma_storage_info('codec_guard')
+WHERE column_name = 'payload' AND segment_type = 'VARCHAR' AND compression = 'DICT_FSST'
+----
+<REGEX>:[1-9][0-9]*
+
+# A 65-row DICT_FSST candidate set exceeds the effective limit of 64 and falls back to a table scan.
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_guard WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT count(*) FROM codec_guard WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# The codec limit rounds down when the configured candidate cap is not divisible by 32.
+statement ok
+SET index_scan_max_count = 2079
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_guard WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+statement ok
+SET index_scan_max_count = 2080
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_guard WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+statement ok
+SET index_scan_max_count = 2048
+
+# A rowid projection is free for codec admission and must not disable the payload check.
+query II
+EXPLAIN ANALYZE SELECT rowid, payload FROM codec_guard WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+# A complete STRUCT projection has no scalar parent segments; skip that column but keep safe scalar checks.
+statement ok
+CREATE TABLE codec_struct(lookup_key INTEGER, residual INTEGER, s STRUCT(x INTEGER))
+
+statement ok
+INSERT INTO codec_struct
+SELECT 42, CASE WHEN i = 1 THEN 1 ELSE 0 END, {'x': i}
+FROM range(128) t(i)
+UNION ALL
+SELECT i % 41, 0, {'x': i}
+FROM range(9872) t(i)
+
+statement ok
+CREATE INDEX codec_struct_lookup ON codec_struct(lookup_key)
+
+query II
+EXPLAIN ANALYZE SELECT s FROM codec_struct WHERE lookup_key = 42 AND residual = 1
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query T
+SELECT s FROM codec_struct WHERE lookup_key = 42 AND residual = 1
+----
+{'x': 1}
+
+# Unsupported columns do not cancel the check of an expensive scalar column in the same Fetch.
+statement ok
+CREATE TABLE codec_struct_payload AS SELECT *, {'x': lookup_key} AS s FROM codec_guard
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_struct_payload_lookup ON codec_struct_payload(lookup_key)
+
+query II
+EXPLAIN ANALYZE SELECT s, payload FROM codec_struct_payload WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query II
+EXPLAIN ANALYZE SELECT s.x, payload FROM codec_struct_payload WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+# Ordinary codecs retain the original factor=1 admission.
+statement ok
+PRAGMA force_compression = 'uncompressed'
+
+statement ok
+CREATE TABLE codec_uncompressed(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_uncompressed
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('u', 4096)
+FROM range(65) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('v', 4096)
+FROM range(9935) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_uncompressed_lookup ON codec_uncompressed(lookup_key)
+
+query I
+SELECT count(*) FROM pragma_storage_info('codec_uncompressed')
+WHERE column_name = 'payload' AND segment_type = 'VARCHAR' AND compression = 'Uncompressed'
+----
+<REGEX>:[1-9][0-9]*
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_uncompressed WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM codec_uncompressed WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# A separate table exercises the exact boundary without making the first query's candidate set ambiguous.
+statement ok
+PRAGMA force_compression = 'dict_fsst'
+
+statement ok
+CREATE TABLE codec_boundary(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_boundary
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('w', 4096)
+FROM range(64) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('x', 4096)
+FROM range(9936) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_boundary_lookup ON codec_boundary(lookup_key)
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_boundary WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM codec_boundary WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# An expensive payload that is not part of the query must not affect admission.
+statement ok
+CREATE TABLE codec_unreferenced(lookup_key INTEGER, residual INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_unreferenced
+SELECT 42, CASE WHEN i = 0 THEN 1 ELSE 0 END, repeat('w', 4096)
+FROM range(65) t(i)
+UNION ALL
+SELECT i % 41, 0, repeat('x', 4096)
+FROM range(9935) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_unreferenced_lookup ON codec_unreferenced(lookup_key)
+
+query I
+SELECT count(*) FROM pragma_storage_info('codec_unreferenced')
+WHERE column_name = 'payload' AND segment_type = 'VARCHAR' AND compression = 'DICT_FSST'
+----
+<REGEX>:[1-9][0-9]*
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM codec_unreferenced WHERE lookup_key = 42 AND residual = 1
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM codec_unreferenced WHERE lookup_key = 42 AND residual = 1
+----
+1
+
+# The filter-only DICT_FSST column is fetched by count(*) and therefore participates in the guard.
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM codec_guard WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+# Rejecting the first broad ART must not prevent a later selective ART from being used.
+statement ok
+CREATE TABLE codec_fallback(id INTEGER, lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_fallback
+SELECT i, CASE WHEN i < 65 THEN 42 ELSE i % 41 END,
+       CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('w', 4096)
+FROM range(10000) t(i)
+
+statement ok
+CREATE INDEX codec_fallback_lookup ON codec_fallback(lookup_key)
+
+statement ok
+CREATE INDEX codec_fallback_id ON codec_fallback(id)
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_fallback
+WHERE lookup_key = 42 AND id = 0 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM codec_fallback
+WHERE lookup_key = 42 AND id = 0 AND residual = 'keep'
+----
+1
+
+# ZSTD is also a guarded point-fetch codec.
+statement ok
+PRAGMA force_compression = 'zstd'
+
+statement ok
+CREATE TABLE codec_zstd(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_zstd
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('z', 4096)
+FROM range(65) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('q', 4096)
+FROM range(9935) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_zstd_lookup ON codec_zstd(lookup_key)
+
+query I
+SELECT count(*) FROM pragma_storage_info('codec_zstd')
+WHERE column_name = 'payload' AND segment_type = 'VARCHAR' AND compression = 'ZSTD'
+----
+<REGEX>:[1-9][0-9]*
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_zstd WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT count(*) FROM codec_zstd WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# A medium ordinary-codec candidate set remains eligible after the metadata walk.
+statement ok
+PRAGMA force_compression = 'uncompressed'
+
+statement ok
+CREATE TABLE codec_medium_plain(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_medium_plain
+SELECT 42, CASE WHEN i = 1 THEN 'keep' ELSE 'reject' END, repeat('p', 4096)
+FROM range(128) t(i)
+UNION ALL
+SELECT i + 1000, 'reject', repeat('p', 128)
+FROM range(99872) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_medium_plain_lookup ON codec_medium_plain(lookup_key)
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_medium_plain WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM codec_medium_plain WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# A large table with 128 ZSTD candidates exercises the rejecting path above the 64-row cap.
+statement ok
+PRAGMA force_compression = 'zstd'
+
+statement ok
+CREATE TABLE codec_medium_zstd(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO codec_medium_zstd
+SELECT 42, CASE WHEN i = 1 THEN 'keep' ELSE 'reject' END, repeat('z', 4096)
+FROM range(128) t(i)
+UNION ALL
+SELECT i + 1000, 'reject', repeat('z', 128)
+FROM range(99872) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE INDEX codec_medium_zstd_lookup ON codec_medium_zstd(lookup_key)
+
+query I
+SELECT count(*) FROM pragma_storage_info('codec_medium_zstd')
+WHERE column_name = 'payload' AND segment_type = 'VARCHAR' AND compression = 'ZSTD'
+----
+<REGEX>:[1-9][0-9]*
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM codec_medium_zstd WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT count(*) FROM codec_medium_zstd WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# Same-column mixed codecs are checked by the candidate's actual segment, rather than the first segment.
+statement ok
+ATTACH '{TEMP_DIR}/codec_mixed.db' AS mixed (ROW_GROUP_SIZE 2048)
+
+statement ok
+USE mixed
+
+statement ok
+PRAGMA force_compression = 'uncompressed'
+
+statement ok
+CREATE TABLE mixed_codec(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO mixed_codec
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('a', 100)
+FROM range(2048) t(i)
+
+statement ok
+FORCE CHECKPOINT
+
+statement ok
+PRAGMA force_compression = 'dict_fsst'
+
+statement ok
+INSERT INTO mixed_codec
+SELECT 43, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('b', 100)
+FROM range(2048) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('c', 100)
+FROM range(5904) t(i)
+
+statement ok
+FORCE CHECKPOINT
+
+statement ok
+CREATE INDEX mixed_codec_lookup ON mixed_codec(lookup_key)
+
+query TT
+SELECT DISTINCT compression, (row_group_id = 0)::VARCHAR FROM pragma_storage_info('mixed_codec')
+WHERE column_name = 'residual' AND segment_type = 'VARCHAR' AND compression IN ('Uncompressed', 'DICT_FSST')
+ORDER BY compression
+----
+DICT_FSST	false
+Uncompressed	true
+
+# The first row group is uncompressed and stays eligible at M=2048.
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM mixed_codec WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Index Scan.*
+
+query I
+SELECT count(*) FROM mixed_codec WHERE lookup_key = 42 AND residual = 'keep'
+----
+1
+
+# The second row group is DICT_FSST and is rejected by the stricter admission.
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM mixed_codec WHERE lookup_key = 43 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT count(*) FROM mixed_codec WHERE lookup_key = 43 AND residual = 'keep'
+----
+1
+
+# The only guarded candidate is at the next RowGroup's first row; skipping an ordinary segment must retain it.
+statement ok
+PRAGMA force_compression = 'uncompressed'
+
+statement ok
+CREATE TABLE mixed_codec_cross(lookup_key INTEGER, residual VARCHAR, payload VARCHAR)
+
+statement ok
+INSERT INTO mixed_codec_cross
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('d', 100)
+FROM range(64) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('e', 100)
+FROM range(1984) t(i)
+
+statement ok
+FORCE CHECKPOINT
+
+statement ok
+PRAGMA force_compression = 'dict_fsst'
+
+statement ok
+INSERT INTO mixed_codec_cross
+SELECT 42, CASE WHEN i = 0 THEN 'keep' ELSE 'reject' END, repeat('f', 100)
+FROM range(1) t(i)
+UNION ALL
+SELECT i % 41, 'reject', repeat('g', 100)
+FROM range(2047) t(i)
+
+statement ok
+FORCE CHECKPOINT
+
+statement ok
+CREATE INDEX mixed_codec_cross_lookup ON mixed_codec_cross(lookup_key)
+
+query II
+EXPLAIN ANALYZE SELECT payload FROM mixed_codec_cross WHERE lookup_key = 42 AND residual = 'keep'
+----
+analyzed_plan	<REGEX>:.*Type: Sequential Scan.*
+
+query I
+SELECT count(*) FROM mixed_codec_cross WHERE lookup_key = 42 AND residual = 'keep'
+----
+2
+
+statement ok
+USE codec_admission
+
+statement ok
+DETACH mixed

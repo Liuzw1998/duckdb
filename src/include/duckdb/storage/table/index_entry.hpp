@@ -10,6 +10,7 @@
 
 #include "duckdb/common/enums/constraint_check_mode.hpp"
 #include "duckdb/common/enums/index_removal_type.hpp"
+#include "duckdb/common/optional.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/execution/index/bound_index.hpp"
@@ -180,6 +181,15 @@ public:
 	template <class TARGET>
 	IndexReadHandle<TARGET> GetReadHandle() {
 		return IndexReadHandle<TARGET>(shared_from_this(), lock.GetSharedLock());
+	}
+	//! Acquire shared access if the entry still owns a bound physical index.
+	template <class TARGET>
+	optional<IndexReadHandle<TARGET>> TryGetReadHandle() {
+		auto entry_lock = lock.GetSharedLock();
+		if (bind_state != IndexBindState::BOUND) {
+			return nullopt;
+		}
+		return IndexReadHandle<TARGET>(shared_from_this(), std::move(entry_lock));
 	}
 	//! Acquire exclusive access to the physical index and checkpoint state.
 	template <class TARGET>
